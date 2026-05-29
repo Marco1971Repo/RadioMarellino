@@ -6,15 +6,15 @@
 #include <RotaryEncoder.h>
 #define DEBUGGAME
 // I2S pin
-#define I2S_DOUT   26
-#define I2S_BCLK   27
-#define I2S_LRC    25
+#define I2S_DOUT   12
+#define I2S_BCLK   13
+#define I2S_LRC    14
 //#define I2S_MCLK   19
 
 // kY-040
-#define PIN_DT  6
-#define PIN_CLK 5
-#define PIN_SW  4
+#define PIN_DT  44
+#define PIN_CLK 41
+#define PIN_SW  43
 enum MachineStates {
     STATE_INIT,
     STATE_WAITWIFICONNECTION,
@@ -187,8 +187,8 @@ void loop() {
 
         case STATE_INIT:
             logSuSeriale(F("[STATE] INIT\n"));
-            audio.setPinout(I2S_BCLK, I2S_LRC, I2S_DOUT, I2S_MCLK);
-            audio.setVolume(64);            
+            audio.setPinout(I2S_BCLK, I2S_LRC, I2S_DOUT);
+            audio.setVolume(32);            
             
             // Prova a caricare la configurazione da Flash
             if (loadWifiConfig()) {
@@ -216,6 +216,7 @@ void loop() {
                 }
             } else {
                 logSuSeriale(F("\n[WiFi] Connesso - IP: %s\n"), WiFi.localIP().toString().c_str());
+                audio.connecttohost("http://4c4b867c89244861ac216426883d1ad0.msvdn.net/radiodeejay/radiodeejay/master_ma.m3u8");
                 currentState = STATE_PLAYER;
             }
             break;
@@ -260,6 +261,22 @@ void loop() {
         default:
             break;            
     }
+}
+// ─────────────────────────────────────────────────────────────────────────────
+// Callback Audio
+// ─────────────────────────────────────────────────────────────────────────────
+void audio_info(const char* info) {
+    logSuSeriale(F("[AUDIO] %s\n"), info);
+}
+
+void audio_showstation(const char* info) {
+    logSuSeriale(F("[STATION] %s\n"), info);
+    
+}
+
+void audio_showstreamtitle(const char* info) {
+    logSuSeriale(F("[TITLE] %s\n"), info);
+    
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
