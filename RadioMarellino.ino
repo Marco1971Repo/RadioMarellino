@@ -4,17 +4,28 @@
 #include <LittleFS.h>
 #include <ArduinoJson.h>
 #include <RotaryEncoder.h>
+#include <ArduinoJson.h>
+#include <vector>
+
+// Definizione della struttura semplificata
+struct Station {
+    String name;
+    String url;
+};
+
+// Il vettore globale che conterrà le stazioni in RAM
+std::vector<Station> stations;
 #define DEBUGGAME
 // I2S pin
 #define I2S_DOUT   12
 #define I2S_BCLK   13
 #define I2S_LRC    14
-//#define I2S_MCLK   19
 
 // kY-040
-#define PIN_DT  44
+#define PIN_DT  42
 #define PIN_CLK 41
-#define PIN_SW  43
+#define PIN_SW  38
+
 enum MachineStates {
     STATE_INIT,
     STATE_WAITWIFICONNECTION,
@@ -39,24 +50,24 @@ String wifiPass = "";
 unsigned long connectionStartTime = 0;
 const unsigned long WIFI_TIMEOUT_MS = 15000;
 
-// A pointer to the dynamic created rotary encoder instance.
-// This will be done in setup()
-RotaryEncoder *encoder = nullptr;
-
-/**
- * @brief The interrupt service routine will be called on any change of one of the input signals.
- */
-IRAM_ATTR void checkPosition()
-{
-  encoder->tick(); // just call tick() to check the state.
-}
-
-
 // Prototipi funzioni debug
 void logSuSeriale(const __FlashStringHelper *frmt, ...);
 
-// ── Gestione File di Configurazione ──────────────────────────────────────────
+RotaryEncoder encoder(PIN_DT, PIN_CLK, RotaryEncoder::LatchMode::TWO03);
 
+#define ROTARYSTEPS 2
+#define ROTARYMIN 0
+#define ROTARYMAX 64
+
+// Last known rotary position.
+int lastPos = -1;
+
+// ── Variabili globali pending play ───────────────────────────────────────────
+String pendingUrl    = "";
+bool hasPendingPlay  = false;
+
+// ── Gestione File di Configurazione ──────────────────────────────────────────
+bool loadStations();
 bool loadWifiConfig() {
     if (!LittleFS.begin(true)) {
         logSuSeriale(F("[CFG] LittleFS mount fallito\n"));
@@ -156,18 +167,79 @@ void handleSave() {
     }
 }
 
-// ── Setup & Loop ─────────────────────────────────────────────────────────────
+// ── Callback Audio (nuova API 3.x) ───────────────────────────────────────────
 
+void my_audio_info(Audio::msg_t m) {
+    // Intercetta redirect verso HTTPS e forza HTTP
+    if (m.e == Audio::evt_info) {
+        String s = String(m.msg);
+        if (s.indexOf("redirect to new host") >= 0) {
+            if (s.indexOf("https://") >= 0 && s.indexOf("play1.m3u8") >= 0) {
+                int start = s.indexOf("https://");
+                String url = s.substring(start);
+                url.trim();
+                url.replace("\"", "");
+                url.replace("https://", "http://");
+                pendingUrl      = url;
+                hasPendingPlay  = true;
+                logSuSeriale(F("[REDIRECT] Forzato HTTP: %s\n"), url.c_str());
+            }
+        }
+    }
+
+    switch (m.e) {
+        case Audio::evt_info:           logSuSeriale(F("info: ....... %s\n"), m.msg); break;
+        case Audio::evt_eof:            logSuSeriale(F("end of file:  %s\n"), m.msg); break;
+        case Audio::evt_bitrate:        logSuSeriale(F("bitrate: .... %s\n"), m.msg); break;
+        case Audio::evt_icyurl:         logSuSeriale(F("icy URL: .... %s\n"), m.msg); break;
+        case Audio::evt_id3data:        logSuSeriale(F("ID3 data: ... %s\n"), m.msg); break;
+        case Audio::evt_lasthost:       logSuSeriale(F("last URL: ... %s\n"), m.msg); break;
+        case Audio::evt_name:           logSuSeriale(F("station name: %s\n"), m.msg); break;
+        case Audio::evt_streamtitle:    logSuSeriale(F("stream title: %s\n"), m.msg); break;
+        case Audio::evt_icylogo:        logSuSeriale(F("icy logo: ... %s\n"), m.msg); break;
+        case Audio::evt_icydescription: logSuSeriale(F("icy descr: .. %s\n"), m.msg); break;
+        case Audio::evt_log:            logSuSeriale(F("audio_logs:   %s\n"), m.msg); break;
+        default:                        logSuSeriale(F("message:..... %s\n"), m.msg); break;
+    }
+}
+
+// ── Setup & Loop ─────────────────────────────────────────────────────────────
+//#define CONFIG_FIRST_RUN
 void setup() {
 #ifdef DEBUGGAME
     Serial.begin(115200);
 #endif
-  // use TWO03 mode when PIN_IN1, PIN_IN2 signals are both LOW or HIGH in latch position.
-    encoder = new RotaryEncoder(PIN_DT, PIN_CLK, RotaryEncoder::LatchMode::TWO03);
-
-    // register interrupt routine
-    attachInterrupt(digitalPinToInterrupt(PIN_CLK), checkPosition, CHANGE);
-    attachInterrupt(digitalPinToInterrupt(PIN_DT), checkPosition, CHANGE);
+    encoder.setPosition(32 / ROTARYSTEPS);
+    Audio::audio_info_callback = my_audio_info;
+#ifdef CONFIG_FIRST_RUN
+    // Blocco di ripristino/creazione forzata del JSON (messo sotto ifdef come concordato)
+    if (LittleFS.begin(true)) {
+        File f = LittleFS.open("/stations.json", "w");
+        if (f) {
+            f.print(R"(
+                {"stations":[{"name":"Radio Deejay","url":"http://streamcdnb1-4c4b867c89244861ac216426883d1ad0.msvdn.net/radiodeejay/radiodeejay/play1.m3u8"},
+                {"name":"Radio Deejay 1","url":"http://4c4b867c89244861ac216426883d1ad0.msvdn.net/radiodeejay/radiodeejay/master_ma.m3u8"},
+                {"name":"Virgin Radio","url":"http://icy.unitedradio.it/Virgin.mp3"},
+                {"name":"Virgin Rock 80","url":"http://icy.unitedradio.it/VirginRock80.mp3"},
+                {"name":"Virgin Rock 90","url":"http://icy.unitedradio.it/Virgin_03.mp3"},
+                {"name":"Vr Classic Rock","url":"http://icy.unitedradio.it/VirginRockClassics.mp3"},
+                {"name":"Vr Queen","url":"http://icy.unitedradio.it/Virgin_05.mp3"},
+                {"name":"Vr AC-DC","url":"http://icy.unitedradio.it/um1026.mp3"},
+                {"name":"Controradio","url":"http://streaming.controradio.it:8190/;?type=http&nocache=76494"},
+                {"name":"Deejay 80","url":"http://streamcdnf25-4c4b867c89244861ac216426883d1ad0.msvdn.net/webradio/deejay80/live.m3u8"},
+                {"name":"On The Road","url":"http://streamcdnm5-4c4b867c89244861ac216426883d1ad0.msvdn.net/webradio/deejayontheroad/live.m3u8"},
+                {"name":"Tropical Pizza","url":"http://streamcdnm12-4c4b867c89244861ac216426883d1ad0.msvdn.net/webradio/deejaytropicalpizza/live.m3u8"},
+                {"name":"Mitology","url":"http://onair15.xdevel.com:9120/;stream.mp3"},
+                {"name":"RTL 102.5","url":"https://dd782ed59e2a4e86aabf6fc508674b59.msvdn.net/live/S97044836/tbbP8T1ZRPBL/playlist_audio.m3u8"},
+                {"name":"Radio 105","url":"http://icecast.unitedradio.it/Radio105.mp3"},{"name":"Subasio","url":"http://icy.unitedradio.it/Subasio.mp3"},
+                {"name":"M2O","url":"http://4c4b867c89244861ac216426883d1ad0.msvdn.net/radiom2o/radiom2o/master_ma.m3u8"}]}
+                )");
+            f.close();
+        }
+        LittleFS.end();
+    }
+ #endif
+    loadStations();
     // ── Diagnostica memoria ──────────────────────────
     uint32_t psram_size = ESP.getPsramSize();
     if (psram_size > 0) {
@@ -178,8 +250,9 @@ void setup() {
         logSuSeriale(F("PSRAM: non rilevata\n"));
     }
 
-    logSuSeriale(F("SRAM: %u KB totali, %u KB liberi\n"),  ESP.getHeapSize() / 1024, ESP.getFreeHeap() / 1024);
+    logSuSeriale(F("SRAM: %u KB totali, %u KB liberi\n"), ESP.getHeapSize() / 1024, ESP.getFreeHeap() / 1024);
     logSuSeriale(F("--------------------------------\n"));
+    gpio_set_drive_capability((gpio_num_t)13, GPIO_DRIVE_CAP_3);
 }
 
 void loop() {
@@ -188,7 +261,9 @@ void loop() {
         case STATE_INIT:
             logSuSeriale(F("[STATE] INIT\n"));
             audio.setPinout(I2S_BCLK, I2S_LRC, I2S_DOUT);
-            audio.setVolume(32);            
+            audio.setVolumeSteps(64);
+            audio.setVolume(16);
+            
             
             // Prova a caricare la configurazione da Flash
             if (loadWifiConfig()) {
@@ -205,7 +280,6 @@ void loop() {
 
         case STATE_WAITWIFICONNECTION:
             if (WiFi.status() != WL_CONNECTED) {
-                // Controlla se il timeout è scaduto
                 if (millis() - connectionStartTime > WIFI_TIMEOUT_MS) {
                     logSuSeriale(F("\n[WiFi] Timeout connessione esaurito. Passaggio ad AP.\n"));
                     WiFi.disconnect();
@@ -226,21 +300,18 @@ void loop() {
             logSuSeriale(F("[STATE] START AP\n"));
             WiFi.disconnect();
             WiFi.mode(WIFI_AP);
-            // Configurazione IP Statico per l'Access Point
             IPAddress local_IP(192, 168, 1, 1);
             IPAddress gateway(192, 168, 1, 1);
             IPAddress subnet(255, 255, 255, 0);
             
             if (!WiFi.softAPConfig(local_IP, gateway, subnet)) {
                 logSuSeriale(F("[AP] Configurazione IP statico fallita!\n"));
-            }            
-            // Configura un IP statico per l'AP (opzionale, ma consigliato per stabilità)
+            }
             WiFi.softAP("RadioMarellino_Setup", ""); 
             
-            logSuSeriale(F("[AP] Configurato. SSID: ESP32_Radio_Setup\n"));
+            logSuSeriale(F("[AP] Configurato. SSID: RadioMarellino_Setup\n"));
             logSuSeriale(F("[AP] IP: %s\n"), WiFi.softAPIP().toString().c_str());
 
-            // Configura i path del WebServer
             server.on("/", HTTP_GET, handleRoot);
             server.on("/save", HTTP_POST, handleSave);
             server.begin();
@@ -249,36 +320,94 @@ void loop() {
             currentState = STATE_AP_MODE;
             break;
         }
+
         case STATE_AP_MODE:
             server.handleClient();
-            delay(2); // Cede il controllo al background task dell'ESP32
+            delay(2);
             break;
 
         case STATE_PLAYER:
-            audio.loop();   
-            break;                        
-        
+        {
+            audio.loop();
+            encoder.tick();
+
+            if (hasPendingPlay) {
+                hasPendingPlay = false;
+                logSuSeriale(F("[PLAYER] Riconnessione a: %s\n"), pendingUrl.c_str());
+                audio.connecttohost(pendingUrl.c_str());
+            }
+
+            int newPos = encoder.getPosition() * ROTARYSTEPS;
+
+            if (newPos < ROTARYMIN) {
+                encoder.setPosition(ROTARYMIN / ROTARYSTEPS);
+                newPos = ROTARYMIN;
+            } else if (newPos > ROTARYMAX) {
+                encoder.setPosition(ROTARYMAX / ROTARYSTEPS);
+                newPos = ROTARYMAX;
+            }
+
+            if (lastPos != newPos) {
+                lastPos = newPos;
+                audio.setVolume(lastPos);
+            }
+
+            vTaskDelay(1);
+            break;
+        }
+
         default:
-            break;            
+            break;
     }
 }
-// ─────────────────────────────────────────────────────────────────────────────
-// Callback Audio
-// ─────────────────────────────────────────────────────────────────────────────
-void audio_info(const char* info) {
-    logSuSeriale(F("[AUDIO] %s\n"), info);
-}
 
-void audio_showstation(const char* info) {
-    logSuSeriale(F("[STATION] %s\n"), info);
+bool loadStations() {
+    if (!LittleFS.begin(true)) {
+        logSuSeriale(F("[ERR] Impossibile inizializzare LittleFS\n"));
+        return false;
+    }
+
+    File f = LittleFS.open("/stations.json", "r");
+    if (!f) {
+        logSuSeriale(F("[ERR] Impossibile aprire stations.json\n"));
+        LittleFS.end();
+        return false;
+    }
+
+    // Alloca il documento per il parsing (ArduinoJson v7 gestisce la RAM dinamicamente)
+    JsonDocument doc;
+    DeserializationError err = deserializeJson(doc, f);
+    f.close();
+    LittleFS.end(); // Chiudiamo il fìlesystem appena abbiamo finito
+
+    if (err) {
+        logSuSeriale(F("[ERR] Errore parsing JSON: %s\n"), err.c_str());
+        return false;
+    }
+
+    // Estrae l'array principale e verifica che sia valido
+    JsonArray arr = doc["stations"].as<JsonArray>();
+    if (arr.isNull()) {
+        logSuSeriale(F("[ERR] Formato JSON non valido (manca l'array 'stations')\n"));
+        return false;
+    }
+
+    stations.clear();
     
-}
+    // Ottimizzazione: riserva lo spazio in memoria per evitare riallocazioni continue nel vettore
+    stations.reserve(arr.size()); 
 
-void audio_showstreamtitle(const char* info) {
-    logSuSeriale(F("[TITLE] %s\n"), info);
-    
-}
+    // Popola il vettore
+    for (JsonObject s : arr) {
+        stations.push_back({
+            s["name"].as<String>(),
+            s["url"].as<String>()
+        });
+    }
 
+    logSuSeriale(F("[CFG] Stazioni caricate con successo: %d\n"), stations.size());
+    return true;
+}
 // ─────────────────────────────────────────────────────────────────────────────
 // Debug log
 // ─────────────────────────────────────────────────────────────────────────────
