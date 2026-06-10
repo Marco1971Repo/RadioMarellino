@@ -11,6 +11,7 @@
 struct Station {
     String name;
     String url;
+    String nameLang;  // es. "it", "en", "de"
 };
 
 // Il vettore globale che conterrà le stazioni in RAM
@@ -21,10 +22,16 @@ std::vector<Station> stations;
 #define I2S_BCLK   13
 #define I2S_LRC    14
 
-// kY-040
+// kY-040 (Primo Encoder - Gestisce il Volume)
 #define PIN_DT  42
 #define PIN_CLK 41
 #define PIN_SW  38
+
+// ── [AGGIUNTA ENCODER 2 STAZIONI] ────────────────────────────────────────────
+// Definiamo i pin per il secondo encoder dedicato al cambio stazione.
+#define PIN_ST_DT   4  
+#define PIN_ST_CLK  5  
+// ─────────────────────────────────────────────────────────────────────────────
 
 enum MachineStates {
     STATE_INIT,
@@ -53,7 +60,14 @@ const unsigned long WIFI_TIMEOUT_MS = 15000;
 // Prototipi funzioni debug
 void logSuSeriale(const __FlashStringHelper *frmt, ...);
 
-RotaryEncoder encoder(PIN_DT, PIN_CLK, RotaryEncoder::LatchMode::TWO03);
+RotaryEncoder encoderVolume(PIN_DT, PIN_CLK, RotaryEncoder::LatchMode::TWO03);
+
+// ── [AGGIUNTA ENCODER 2 STAZIONI] ────────────────────────────────────────────
+// Istanza del secondo encoder e relative variabili di tracciamento posizione
+RotaryEncoder encoderStazioni(PIN_ST_DT, PIN_ST_CLK, RotaryEncoder::LatchMode::TWO03);
+int lastStPos = 0;            // Ultima posizione nota dell'encoder stazioni
+int currentStationIdx = 0;    // Indice della stazione attualmente in riproduzione
+// ─────────────────────────────────────────────────────────────────────────────
 
 #define ROTARYSTEPS 2
 #define ROTARYMIN 0
@@ -65,7 +79,7 @@ int lastPos = -1;
 // ── Variabili globali pending play ───────────────────────────────────────────
 String pendingUrl    = "";
 bool hasPendingPlay  = false;
-
+bool isSpeakingStation = false;
 // ── Gestione File di Configurazione ──────────────────────────────────────────
 bool loadStations();
 bool loadWifiConfig() {
@@ -166,9 +180,8 @@ void handleSave() {
         server.send(400, "text/plain", "Bad Request");
     }
 }
-
+/*
 // ── Callback Audio (nuova API 3.x) ───────────────────────────────────────────
-
 void my_audio_info(Audio::msg_t m) {
     // Intercetta redirect verso HTTPS e forza HTTP
     if (m.e == Audio::evt_info) {
@@ -186,7 +199,6 @@ void my_audio_info(Audio::msg_t m) {
             }
         }
     }
-
     switch (m.e) {
         case Audio::evt_info:           logSuSeriale(F("info: ....... %s\n"), m.msg); break;
         case Audio::evt_eof:            logSuSeriale(F("end of file:  %s\n"), m.msg); break;
@@ -202,34 +214,56 @@ void my_audio_info(Audio::msg_t m) {
         default:                        logSuSeriale(F("message:..... %s\n"), m.msg); break;
     }
 }
-
+*/
+void audio_info(const char* info) {
+    /*logSuSeriale(F("[AUDIO] %s\n"), info);
+    logSuSeriale(F("SRAM: %u KB totali, %u KB liberi\n"),  ESP.getHeapSize() / 1024, ESP.getFreeHeap() / 1024);
+    logSuSeriale(F("PSRAM: %u KB tot | %u KB liberi | min: %u KB\n"), ESP.getPsramSize() / 1024,  ESP.getFreePsram() / 1024,   ESP.getMinFreePsram() / 1024);*/
+    /* String s = String(info);
+    if (s.indexOf("redirect to new host") >= 0 && s.indexOf("https://") >= 0) {
+        int start = s.indexOf("https://");
+        String url = s.substring(start);
+        url.trim();
+        url.replace("\"", "");
+        url.replace("https://", "http://");
+        pendingUrl     = url;
+        hasPendingPlay = true;
+        logSuSeriale(F("[REDIRECT] Forzato HTTP: %s\n"), url.c_str());
+    }*/
+}
 // ── Setup & Loop ─────────────────────────────────────────────────────────────
-//#define CONFIG_FIRST_RUN
+//#define CONFIG_WRITE_JSON_RADIO
 void setup() {
 #ifdef DEBUGGAME
     Serial.begin(115200);
 #endif
-    encoder.setPosition(32 / ROTARYSTEPS);
-    Audio::audio_info_callback = my_audio_info;
-#ifdef CONFIG_FIRST_RUN
+    encoderVolume.setPosition(32 / ROTARYSTEPS);
+
+    // ── [AGGIUNTA ENCODER 2 STAZIONI] ────────────────────────────────────────────
+    // Inizializziamo la posizione di partenza dell'encoder stazioni a 0
+    encoderStazioni.setPosition(0);
+    // ─────────────────────────────────────────────────────────────────────────────
+
+    //Audio::audio_info_callback = my_audio_info;
+#ifdef CONFIG_WRITE_JSON_RADIO 
     // Blocco di ripristino/creazione forzata del JSON (messo sotto ifdef come concordato)
     if (LittleFS.begin(true)) {
+        LittleFS.remove("/stations.json");   // cancella esplicitamente prima
         File f = LittleFS.open("/stations.json", "w");
         if (f) {
             f.print(R"(
-                {"stations":[{"name":"Radio Deejay","url":"http://streamcdnb1-4c4b867c89244861ac216426883d1ad0.msvdn.net/radiodeejay/radiodeejay/play1.m3u8"},
-                {"name":"Radio Deejay 1","url":"http://4c4b867c89244861ac216426883d1ad0.msvdn.net/radiodeejay/radiodeejay/master_ma.m3u8"},
-                {"name":"Virgin Radio","url":"http://icy.unitedradio.it/Virgin.mp3"},
-                {"name":"Virgin Rock 80","url":"http://icy.unitedradio.it/VirginRock80.mp3"},
-                {"name":"Virgin Rock 90","url":"http://icy.unitedradio.it/Virgin_03.mp3"},
-                {"name":"Vr Classic Rock","url":"http://icy.unitedradio.it/VirginRockClassics.mp3"},
-                {"name":"Vr Queen","url":"http://icy.unitedradio.it/Virgin_05.mp3"},
-                {"name":"Vr AC-DC","url":"http://icy.unitedradio.it/um1026.mp3"},
+                {"stations":[{"name":"Radio Deejay","url":"http://streamcdnb1-4c4b867c89244861ac216426883d1ad0.msvdn.net/radiodeejay/radiodeejay/play1.m3u8", "nameLang":"en"},
+                {"name":"Virgin Radio","url":"http://icy.unitedradio.it/Virgin.mp3", "nameLang":"en"},
+                {"name":"Virgin Rock 80","url":"http://icy.unitedradio.it/VirginRock80.mp3", "nameLang":"en"},
+                {"name":"Virgin Rock 90","url":"http://icy.unitedradio.it/Virgin_03.mp3", "nameLang":"en"},
+                {"name":"Virgin Classic Rock","url":"http://icy.unitedradio.it/VirginRockClassics.mp3", "nameLang":"en"},
+                {"name":"Virgin Queen","url":"http://icy.unitedradio.it/Virgin_05.mp3", "nameLang":"en"},
+                {"name":"Virgin AC-DC","url":"http://icy.unitedradio.it/um1026.mp3", "nameLang":"en"},
                 {"name":"Controradio","url":"http://streaming.controradio.it:8190/;?type=http&nocache=76494"},
-                {"name":"Deejay 80","url":"http://streamcdnf25-4c4b867c89244861ac216426883d1ad0.msvdn.net/webradio/deejay80/live.m3u8"},
-                {"name":"On The Road","url":"http://streamcdnm5-4c4b867c89244861ac216426883d1ad0.msvdn.net/webradio/deejayontheroad/live.m3u8"},
+                {"name":"Deejay 80","url":"http://streamcdnf25-4c4b867c89244861ac216426883d1ad0.msvdn.net/webradio/deejay80/live.m3u8", "nameLang":"en"},
+                {"name":"On The Road","url":"http://streamcdnm5-4c4b867c89244861ac216426883d1ad0.msvdn.net/webradio/deejayontheroad/live.m3u8", "nameLang":"en"},
                 {"name":"Tropical Pizza","url":"http://streamcdnm12-4c4b867c89244861ac216426883d1ad0.msvdn.net/webradio/deejaytropicalpizza/live.m3u8"},
-                {"name":"Mitology","url":"http://onair15.xdevel.com:9120/;stream.mp3"},
+                {"name":"Mitology","url":"http://onair15.xdevel.com:9120/;stream.mp3", "nameLang":"en"},
                 {"name":"RTL 102.5","url":"https://dd782ed59e2a4e86aabf6fc508674b59.msvdn.net/live/S97044836/tbbP8T1ZRPBL/playlist_audio.m3u8"},
                 {"name":"Radio 105","url":"http://icecast.unitedradio.it/Radio105.mp3"},{"name":"Subasio","url":"http://icy.unitedradio.it/Subasio.mp3"},
                 {"name":"M2O","url":"http://4c4b867c89244861ac216426883d1ad0.msvdn.net/radiom2o/radiom2o/master_ma.m3u8"}]}
@@ -290,7 +324,9 @@ void loop() {
                 }
             } else {
                 logSuSeriale(F("\n[WiFi] Connesso - IP: %s\n"), WiFi.localIP().toString().c_str());
-                audio.connecttohost("http://4c4b867c89244861ac216426883d1ad0.msvdn.net/radiodeejay/radiodeejay/master_ma.m3u8");
+                isSpeakingStation = true;
+                audio.connecttospeech(stations[currentStationIdx].name.c_str(),
+                                    stations[currentStationIdx].nameLang.c_str());
                 currentState = STATE_PLAYER;
             }
             break;
@@ -329,7 +365,12 @@ void loop() {
         case STATE_PLAYER:
         {
             audio.loop();
-            encoder.tick();
+            encoderVolume.tick();
+
+            // ── [AGGIUNTA ENCODER 2 STAZIONI] ────────────────────────────────────────────
+            // Interroghiamo lo stato del secondo encoder a ogni loop
+            encoderStazioni.tick();
+            // ─────────────────────────────────────────────────────────────────────────────
 
             if (hasPendingPlay) {
                 hasPendingPlay = false;
@@ -337,13 +378,13 @@ void loop() {
                 audio.connecttohost(pendingUrl.c_str());
             }
 
-            int newPos = encoder.getPosition() * ROTARYSTEPS;
+            int newPos = encoderVolume.getPosition() * ROTARYSTEPS;
 
             if (newPos < ROTARYMIN) {
-                encoder.setPosition(ROTARYMIN / ROTARYSTEPS);
+                encoderVolume.setPosition(ROTARYMIN / ROTARYSTEPS);
                 newPos = ROTARYMIN;
             } else if (newPos > ROTARYMAX) {
-                encoder.setPosition(ROTARYMAX / ROTARYSTEPS);
+                encoderVolume.setPosition(ROTARYMAX / ROTARYSTEPS);
                 newPos = ROTARYMAX;
             }
 
@@ -351,6 +392,35 @@ void loop() {
                 lastPos = newPos;
                 audio.setVolume(lastPos);
             }
+
+            // ── [AGGIUNTA ENCODER 2 STAZIONI] ────────────────────────────────────────────
+            // Logica indipendente per scorrere la lista delle stazioni caricate in RAM
+            int newStPos = encoderStazioni.getPosition();
+            if (lastStPos != newStPos) {
+                if (isSpeakingStation) {
+                    // Annuncio in corso: risincronizza l'encoder alla posizione attuale
+                    // così i tick accumulati durante la rotazione vengono ignorati
+                    encoderStazioni.setPosition(currentStationIdx);
+                    lastStPos = currentStationIdx;
+                } else if (!stations.empty()) {
+                    if (newStPos > lastStPos) {
+                        currentStationIdx++;
+                        if (currentStationIdx >= (int)stations.size()) currentStationIdx = 0;
+                    } else {
+                        currentStationIdx--;
+                        if (currentStationIdx < 0) currentStationIdx = (int)stations.size() - 1;
+                    }
+
+                    encoderStazioni.setPosition(currentStationIdx);
+                    lastStPos = currentStationIdx;
+
+                    logSuSeriale(F("[PLAYER] Cambio stazione: %s\n"), stations[currentStationIdx].name.c_str());
+                    isSpeakingStation = true;
+                    audio.connecttospeech(stations[currentStationIdx].name.c_str(),
+                                        stations[currentStationIdx].nameLang.c_str());
+                }
+            }
+            // ─────────────────────────────────────────────────────────────────────────────
 
             vTaskDelay(1);
             break;
@@ -398,15 +468,26 @@ bool loadStations() {
     stations.reserve(arr.size()); 
 
     // Popola il vettore
+
     for (JsonObject s : arr) {
+        String nameLang = s["nameLang"] | "it";   // default "it" se manca il campo
         stations.push_back({
             s["name"].as<String>(),
-            s["url"].as<String>()
+            s["url"].as<String>(),
+            nameLang
         });
     }
 
     logSuSeriale(F("[CFG] Stazioni caricate con successo: %d\n"), stations.size());
     return true;
+}
+
+void audio_eof_speech(const char* info) {
+    if (!isSpeakingStation) return;
+    isSpeakingStation = false;
+    logSuSeriale(F("[TTS] Fine annuncio: %s\n"), stations[currentStationIdx].name.c_str());
+    if (!audio.connecttohost(stations[currentStationIdx].url.c_str()))
+        ESP.restart();
 }
 // ─────────────────────────────────────────────────────────────────────────────
 // Debug log
