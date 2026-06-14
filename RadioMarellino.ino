@@ -5,6 +5,7 @@
 #include <ArduinoJson.h>
 #include <RotaryEncoder.h>
 #include <OneButton.h>
+#include <Adafruit_NeoPixel.h>
 #include <vector>
 #include "esp_sleep.h"
 
@@ -35,18 +36,30 @@ std::vector<Station> stations;
 #define PIN_ST_DT   4
 #define PIN_ST_CLK  5
 
+// ── LED RGB WS2812B ───────────────────────────────────────────────────────────
+#define PIN_LED_RGB  48
+#define NUM_LEDS     1
+Adafruit_NeoPixel rgb(NUM_LEDS, PIN_LED_RGB, NEO_GRB + NEO_KHZ800);
+
+// Colori LED
+#define LED_OFF    rgb.Color(0,   0,   0)
+#define LED_YELLOW rgb.Color(128, 128,  0)   // attesa WiFi
+#define LED_RED    rgb.Color(128,   0,  0)   // modalità AP
+#define LED_GREEN  rgb.Color(0,   128,  0)   // riproduzione
+#define LED_CYAN   rgb.Color(0,   128, 128)  // annuncio TTS
+
 // ── Parametri encoder volume ──────────────────────────────────────────────────
-#define ROTARYSTEPS  1
-#define ROTARYMIN    0
-#define ROTARYMAX    64
+#define ROTARYSTEPS    1
+#define ROTARYMIN      0
+#define ROTARYMAX      64
 #define VOLUME_DEFAULT 16
 
 // ── GPIO wakeup deep sleep ────────────────────────────────────────────────────
 #define SLEEP_WAKEUP_GPIO  GPIO_NUM_9
 
 // ── RTC memory: sopravvive al deep sleep ──────────────────────────────────────
-RTC_DATA_ATTR int  rtcStationIdx = 0;
-RTC_DATA_ATTR int  rtcVolume     = VOLUME_DEFAULT;
+RTC_DATA_ATTR int rtcStationIdx = 0;
+RTC_DATA_ATTR int rtcVolume     = VOLUME_DEFAULT;
 
 // ── State machine ─────────────────────────────────────────────────────────────
 enum MachineStates {
@@ -64,13 +77,13 @@ Audio     audio;
 WebServer server(80);
 
 // ── Encoder e pulsante ────────────────────────────────────────────────────────
-RotaryEncoder encoderVolume  (PIN_DT,     PIN_CLK,     RotaryEncoder::LatchMode::TWO03);
-RotaryEncoder encoderStazioni(PIN_ST_DT,  PIN_ST_CLK,  RotaryEncoder::LatchMode::TWO03);
+RotaryEncoder encoderVolume  (PIN_DT,    PIN_CLK,    RotaryEncoder::LatchMode::TWO03);
+RotaryEncoder encoderStazioni(PIN_ST_DT, PIN_ST_CLK, RotaryEncoder::LatchMode::TWO03);
 OneButton     btnVolume(PIN_SW, true, true);  // attivo LOW, pull-up interno
 
 // ── Variabili encoder ─────────────────────────────────────────────────────────
-int lastPos      = -1;
-int lastStPos    = 0;
+int lastPos           = -1;
+int lastStPos         = 0;
 int currentStationIdx = 0;
 
 // ── Credenziali WiFi ──────────────────────────────────────────────────────────
@@ -82,18 +95,101 @@ unsigned long connectionStartTime = 0;
 const unsigned long WIFI_TIMEOUT_MS = 15000;
 
 // ── Stato riproduzione ────────────────────────────────────────────────────────
-String pendingUrl       = "";
-bool   hasPendingPlay   = false;
+String pendingUrl        = "";
+bool   hasPendingPlay    = false;
 bool   isSpeakingStation = false;
+
+// ── Lampeggio LED in AP mode ──────────────────────────────────────────────────
+unsigned long lastBlinkTime = 0;
+bool          blinkState    = false;
+
+// ── Throttle salvataggio stato su flash ───────────────────────────────────────
+// Evita scritture LittleFS continue durante la rotazione dell'encoder volume
+unsigned long lastSaveTime  = 0;
+bool          pendingSave   = false;
+const unsigned long SAVE_DEBOUNCE_MS = 2000;  // salva 2s dopo l'ultima modifica
 
 // ── Prototipi ─────────────────────────────────────────────────────────────────
 void logSuSeriale(const __FlashStringHelper *frmt, ...);
 bool loadStations();
 bool loadWifiConfig();
 bool saveWifiConfig(const String& ssid, const String& pass);
+void loadState();
+void saveState();
+void scheduleSave();
 void goToDeepSleep();
+void setLed(uint32_t color);
 void handleRoot();
 void handleSave();
+
+// ─────────────────────────────────────────────────────────────────────────────
+// LED helper
+// ─────────────────────────────────────────────────────────────────────────────
+void setLed(uint32_t color) {
+    rgb.setPixelColor(0, color);
+    rgb.show();
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Persistenza stato su LittleFS (sopravvive al blackout)
+// ─────────────────────────────────────────────────────────────────────────────
+void loadState() {
+    if (!LittleFS.begin(true)) {
+        logSuSeriale(F("[STATE] LittleFS mount fallito in lettura\n"));
+        return;
+    }
+
+    File f = LittleFS.open("/state.json", "r");
+    if (!f) {
+        logSuSeriale(F("[STATE] state.json non trovato, uso valori default\n"));
+        LittleFS.end();
+        return;
+    }
+
+    JsonDocument doc;
+    if (deserializeJson(doc, f) == DeserializationError::Ok) {
+        rtcStationIdx = doc["station"] | 0;
+        rtcVolume     = doc["volume"]  | VOLUME_DEFAULT;
+        logSuSeriale(F("[STATE] Caricato da flash: stazione=%d, volume=%d\n"),
+                     rtcStationIdx, rtcVolume);
+    } else {
+        logSuSeriale(F("[STATE] Errore parsing state.json\n"));
+    }
+
+    f.close();
+    LittleFS.end();
+}
+
+void saveState() {
+    if (!LittleFS.begin(true)) {
+        logSuSeriale(F("[STATE] LittleFS mount fallito in scrittura\n"));
+        return;
+    }
+
+    File f = LittleFS.open("/state.json", "w");
+    if (!f) {
+        logSuSeriale(F("[STATE] Impossibile aprire state.json in scrittura\n"));
+        LittleFS.end();
+        return;
+    }
+
+    JsonDocument doc;
+    doc["station"] = currentStationIdx;
+    doc["volume"]  = lastPos;
+    serializeJson(doc, f);
+    f.close();
+    LittleFS.end();
+
+    logSuSeriale(F("[STATE] Salvato su flash: stazione=%d, volume=%d\n"),
+                 currentStationIdx, lastPos);
+}
+
+// Pianifica un salvataggio ritardato (evita scritture flash continue
+// durante la rotazione dell'encoder volume)
+void scheduleSave() {
+    lastSaveTime = millis();
+    pendingSave  = true;
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Deep Sleep
@@ -102,17 +198,21 @@ void goToDeepSleep() {
     logSuSeriale(F("[SLEEP] Salvo stato: stazione=%d, volume=%d\n"),
                  currentStationIdx, lastPos);
 
+    // Aggiorno RTC memory
     rtcStationIdx = currentStationIdx;
     rtcVolume     = (lastPos >= ROTARYMIN) ? lastPos : VOLUME_DEFAULT;
 
+    // Salvo su flash (garantisce persistenza anche dopo blackout)
+    saveState();
+
     audio.stopSong();
+    setLed(LED_OFF);
     delay(100);
 
     logSuSeriale(F("[SLEEP] Entro in deep sleep. Premi il pulsante per riaccendere.\n"));
     Serial.flush();
 
-    esp_sleep_enable_ext1_wakeup(1ULL << SLEEP_WAKEUP_GPIO,
-                                 ESP_EXT1_WAKEUP_ANY_LOW);
+    esp_sleep_enable_ext1_wakeup(1ULL << SLEEP_WAKEUP_GPIO, ESP_EXT1_WAKEUP_ANY_LOW);
     esp_deep_sleep_start();
 }
 
@@ -230,13 +330,14 @@ void handleSave() {
 // ─────────────────────────────────────────────────────────────────────────────
 void audio_info(const char* info) {
     // Decommenta per debug audio dettagliato:
-    // logSuSeriale(F("[AUDIO] %s\n"), info);
+     logSuSeriale(F("[AUDIO] %s\n"), info);
 }
 
 void audio_eof_speech(const char* info) {
     if (!isSpeakingStation) return;
     isSpeakingStation = false;
     logSuSeriale(F("[TTS] Fine annuncio: %s\n"), stations[currentStationIdx].name.c_str());
+    setLed(LED_GREEN);   // verde: riproduzione
     if (!audio.connecttohost(stations[currentStationIdx].url.c_str()))
         ESP.restart();
 }
@@ -251,17 +352,27 @@ void setup() {
     Serial.begin(115200);
 #endif
 
-    // ── Log causa wakeup ──────────────────────────────────────────────────────
+    // ── LED: init immediato, visibile fin dal boot ────────────────────────────
+    rgb.begin();
+    rgb.setBrightness(100);
+    setLed(LED_OFF);
+
+    // ── Causa wakeup ──────────────────────────────────────────────────────────
     esp_sleep_wakeup_cause_t cause = esp_sleep_get_wakeup_cause();
-    if (cause == ESP_SLEEP_WAKEUP_EXT1)
-        logSuSeriale(F("[BOOT] Wakeup da deep sleep (pulsante)\n"));
-    else{
+    if (cause == ESP_SLEEP_WAKEUP_EXT1) {
+        logSuSeriale(F("[BOOT] Wakeup da pulsante, avvio normale\n"));
+    } else {
+        // Power-on da corrente (blackout, prima accensione): torna in sleep
         logSuSeriale(F("[BOOT] Power-on da corrente, torno in sleep\n"));
         Serial.flush();
         esp_sleep_enable_ext1_wakeup(1ULL << SLEEP_WAKEUP_GPIO, ESP_EXT1_WAKEUP_ANY_LOW);
         esp_deep_sleep_start();
     }
-    // ── Ripristino stato da RTC memory ────────────────────────────────────────
+
+    // ── Ripristino stato: prima da flash (resiste al blackout),
+    //    poi i valori finiscono in rtcStationIdx/rtcVolume ────────────────────
+    loadState();   // sovrascrive rtcStationIdx e rtcVolume con i dati da flash
+
     currentStationIdx = rtcStationIdx;
     int startVolume   = rtcVolume;
     logSuSeriale(F("[BOOT] Stato ripristinato: stazione=%d, volume=%d\n"),
@@ -271,7 +382,7 @@ void setup() {
     encoderVolume.setPosition(startVolume / ROTARYSTEPS);
     lastPos = startVolume;
 
-    // ── Encoder stazioni: posizione iniziale allineata alla stazione corrente ─
+    // ── Encoder stazioni: allineato alla stazione corrente ────────────────────
     encoderStazioni.setPosition(currentStationIdx);
     lastStPos = currentStationIdx;
 
@@ -280,14 +391,11 @@ void setup() {
     btnVolume.attachClick([]() {
         goToDeepSleep();
     });
-    // Opzionale: doppio click per funzione futura (es. mute, cambio modalità)
-    // btnVolume.attachDoubleClick([]() { ... });
 
     // ── BCLK drive strength (necessario con due MAX98357A in parallelo) ────────
     gpio_set_drive_capability((gpio_num_t)I2S_BCLK, GPIO_DRIVE_CAP_3);
 
 #ifdef CONFIG_WRITE_JSON_RADIO
-    // Blocco di ripristino/creazione forzata del JSON stazioni
     if (LittleFS.begin(true)) {
         LittleFS.remove("/stations.json");
         File f = LittleFS.open("/stations.json", "w");
@@ -295,17 +403,16 @@ void setup() {
             f.print(R"(
 {"stations":[
 {"name":"Radio Deejay","url":"http://streamcdnb1-4c4b867c89244861ac216426883d1ad0.msvdn.net/radiodeejay/radiodeejay/play1.m3u8","nameLang":"en"},
+{"name":"Controradio","url":"http://streaming.controradio.it:8190/;?type=http&nocache=76494","nameLang":"it"},
 {"name":"Virgin Radio","url":"http://icy.unitedradio.it/Virgin.mp3","nameLang":"en"},
+{"name":"Mitology","url":"http://onair15.xdevel.com:9120/;stream.mp3","nameLang":"en"},
+{"name":"BBC World Service","url":"http://stream.live.vc.bbcmedia.co.uk/bbc_world_service","nameLang":"en"},
 {"name":"Virgin Rock 80","url":"http://icy.unitedradio.it/VirginRock80.mp3","nameLang":"en"},
 {"name":"Virgin Rock 90","url":"http://icy.unitedradio.it/Virgin_03.mp3","nameLang":"en"},
 {"name":"Virgin Classic Rock","url":"http://icy.unitedradio.it/VirginRockClassics.mp3","nameLang":"en"},
-{"name":"Virgin Queen","url":"http://icy.unitedradio.it/Virgin_05.mp3","nameLang":"en"},
-{"name":"Virgin AC-DC","url":"http://icy.unitedradio.it/um1026.mp3","nameLang":"en"},
-{"name":"Controradio","url":"http://streaming.controradio.it:8190/;?type=http&nocache=76494","nameLang":"it"},
 {"name":"Deejay 80","url":"http://streamcdnf25-4c4b867c89244861ac216426883d1ad0.msvdn.net/webradio/deejay80/live.m3u8","nameLang":"en"},
 {"name":"On The Road","url":"http://streamcdnm5-4c4b867c89244861ac216426883d1ad0.msvdn.net/webradio/deejayontheroad/live.m3u8","nameLang":"en"},
 {"name":"Tropical Pizza","url":"http://streamcdnm12-4c4b867c89244861ac216426883d1ad0.msvdn.net/webradio/deejaytropicalpizza/live.m3u8","nameLang":"it"},
-{"name":"Mitology","url":"http://onair15.xdevel.com:9120/;stream.mp3","nameLang":"en"},
 {"name":"RTL 102.5","url":"https://dd782ed59e2a4e86aabf6fc508674b59.msvdn.net/live/S97044836/tbbP8T1ZRPBL/playlist_audio.m3u8","nameLang":"it"},
 {"name":"Radio 105","url":"http://icecast.unitedradio.it/Radio105.mp3","nameLang":"it"},
 {"name":"Subasio","url":"http://icy.unitedradio.it/Subasio.mp3","nameLang":"it"},
@@ -319,7 +426,7 @@ void setup() {
 
     loadStations();
 
-    // ── Clamp stazione salvata in caso il JSON sia cambiato ───────────────────
+    // ── Clamp stazione in caso il JSON sia cambiato ───────────────────────────
     if (!stations.empty() && currentStationIdx >= (int)stations.size())
         currentStationIdx = 0;
 
@@ -347,10 +454,11 @@ void loop() {
             logSuSeriale(F("[STATE] INIT\n"));
             audio.setPinout(I2S_BCLK, I2S_LRC, I2S_DOUT);
             audio.setVolumeSteps(64);
-            audio.setVolume(lastPos);  // Volume ripristinato da RTC
+            audio.setVolume(lastPos);  // volume ripristinato da flash
 
             if (loadWifiConfig()) {
                 logSuSeriale(F("[WiFi] Tentativo connessione a: %s\n"), wifiSsid.c_str());
+                setLed(LED_YELLOW);    // giallo: connessione in corso
                 WiFi.mode(WIFI_STA);
                 WiFi.begin(wifiSsid.c_str(), wifiPass.c_str());
                 connectionStartTime = millis();
@@ -375,7 +483,7 @@ void loop() {
             } else {
                 logSuSeriale(F("\n[WiFi] Connesso - IP: %s\n"),
                              WiFi.localIP().toString().c_str());
-                // Annuncio stazione ripristinata
+                setLed(LED_CYAN);      // ciano: annuncio TTS stazione
                 isSpeakingStation = true;
                 audio.connecttospeech(stations[currentStationIdx].name.c_str(),
                                       stations[currentStationIdx].nameLang.c_str());
@@ -405,25 +513,39 @@ void loop() {
             server.begin();
             logSuSeriale(F("[HTTP] Server avviato\n"));
 
+            lastBlinkTime = millis();
             currentState = STATE_AP_MODE;
             break;
         }
 
         // ── AP MODE ───────────────────────────────────────────────────────────
         case STATE_AP_MODE:
-            // Anche in AP permettiamo il deep sleep dal pulsante
+            // Rosso lampeggiante: nessuna rete configurata
+            if (millis() - lastBlinkTime >= 500) {
+                lastBlinkTime = millis();
+                blinkState = !blinkState;
+                setLed(blinkState ? LED_RED : LED_OFF);
+            }
             btnVolume.tick();
             server.handleClient();
             delay(2);
             break;
 
-        // ── PLAYER ───────────────────────────────────────────────────────────
+        // ── PLAYER ────────────────────────────────────────────────────────────
         case STATE_PLAYER:
         {
             audio.loop();
             encoderVolume.tick();
             encoderStazioni.tick();
-            btnVolume.tick();   // gestione click → deep sleep
+            btnVolume.tick();
+
+            // ── Salvataggio ritardato su flash ────────────────────────────────
+            // Evita scritture continue durante la rotazione dell'encoder volume:
+            // scrive su LittleFS solo dopo SAVE_DEBOUNCE_MS di inattività
+            if (pendingSave && (millis() - lastSaveTime >= SAVE_DEBOUNCE_MS)) {
+                pendingSave = false;
+                saveState();
+            }
 
             // ── Pending play (redirect) ───────────────────────────────────────
             if (hasPendingPlay) {
@@ -446,8 +568,8 @@ void loop() {
             if (lastPos != newPos) {
                 lastPos = newPos;
                 audio.setVolume(lastPos);
-                // Aggiorno subito RTC così un eventuale crash non perde il volume
-                rtcVolume = lastPos;
+                rtcVolume = lastPos;   // aggiorna RTC subito (resiste al crash)
+                scheduleSave();        // pianifica scrittura flash ritardata
                 logSuSeriale(F("[VOL] Volume: %d\n"), lastPos);
             }
 
@@ -455,7 +577,7 @@ void loop() {
             int newStPos = encoderStazioni.getPosition();
             if (lastStPos != newStPos) {
                 if (isSpeakingStation) {
-                    // Annuncio in corso: ignora i tick accumulati
+                    // Annuncio in corso: ignora tick accumulati
                     encoderStazioni.setPosition(currentStationIdx);
                     lastStPos = currentStationIdx;
                 } else if (!stations.empty()) {
@@ -465,13 +587,13 @@ void loop() {
                         currentStationIdx = (currentStationIdx - 1 + (int)stations.size()) % (int)stations.size();
 
                     encoderStazioni.setPosition(currentStationIdx);
-                    lastStPos = currentStationIdx;
-
-                    // Aggiorno RTC subito
-                    rtcStationIdx = currentStationIdx;
+                    lastStPos     = currentStationIdx;
+                    rtcStationIdx = currentStationIdx;  // aggiorna RTC subito
+                    scheduleSave();                     // pianifica scrittura flash
 
                     logSuSeriale(F("[PLAYER] Cambio stazione: %s\n"),
                                  stations[currentStationIdx].name.c_str());
+                    setLed(LED_CYAN);   // ciano: annuncio TTS
                     isSpeakingStation = true;
                     audio.connecttospeech(stations[currentStationIdx].name.c_str(),
                                           stations[currentStationIdx].nameLang.c_str());
