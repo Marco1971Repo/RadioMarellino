@@ -76,6 +76,7 @@ enum MachineStates {
     STATE_PLAYER,
     STATE_START_AP,
     STATE_AP_MODE,
+    STATE_STATIONS_CONFIG, // <-- NUOVO STATO: Portale modifica stazioni da connessi
 };
 
 MachineStates currentState = STATE_INIT;
@@ -88,11 +89,13 @@ WebServer server(80);
 RotaryEncoder encoderVolume  (PIN_DT,    PIN_CLK,    RotaryEncoder::LatchMode::TWO03);
 RotaryEncoder encoderStazioni(PIN_ST_DT, PIN_ST_CLK, RotaryEncoder::LatchMode::TWO03);
 OneButton     btnVolume(PIN_SW, true, true);  // attivo LOW, pull-up interno
+OneButton     btnStazioni(PIN_ST_SW, true, true); // <-- NUOVO PULSANTE STAZIONI
 
 // ── Variabili encoder ─────────────────────────────────────────────────────────
 int lastPos           = -1;
 int lastStPos         = 0;
 int currentStationIdx = 0;
+bool vuMeterAttivo    = false;  // <-- MODIFICA: Flag per gestire lo stato ON/OFF del VU-Meter
 
 // ── Credenziali WiFi ──────────────────────────────────────────────────────────
 String wifiSsid = "";
@@ -130,6 +133,7 @@ const unsigned long SAVE_DEBOUNCE_MS = 2000;  // salva 2s dopo l'ultima modifica
 // ── Prototipi ─────────────────────────────────────────────────────────────────
 void logSuSeriale(const __FlashStringHelper *frmt, ...);
 bool loadStations();
+bool saveStationsToFS();
 bool loadWifiConfig();
 bool saveWifiConfig(const String& ssid, const String& pass);
 void loadState();
@@ -139,9 +143,14 @@ void goToDeepSleep();
 void setLed(uint32_t color);
 void handleRoot();
 void handleSave();
+void handleManageStations();
+void handleAddStation();
+void handleDeleteStation();
 void markSkipSleepOnBoot();
 bool consumeSkipSleepFlag();
 void enterApModeFromButton();
+String jsonEscape(const String& s);
+void aggiornaLedVuMeter(uint8_t livello);
 
 // ─────────────────────────────────────────────────────────────────────────────
 // LED helper
@@ -216,7 +225,7 @@ void scheduleSave() {
 
 // ─────────────────────────────────────────────────────────────────────────────
 // WA: marker su flash per distinguere un ESP.restart() voluto (es. dopo
-// salvataggio credenziali WiFi) da un power-on da blackout. Sostituisce il
+// salvataggio credenziali WiFi dal portale AP) da un power-on da blackout. Sostituisce il
 // tentativo con RTC_DATA_ATTR, che non sopravvive al soft-reset su questa
 // board/SDK (verificato sul campo).
 // ─────────────────────────────────────────────────────────────────────────────
@@ -374,7 +383,7 @@ void handleRoot() {
         "button{background-color:#4CAF50;color:white;padding:14px 20px;margin:8px 0;"
         "border:none;width:100%;cursor:pointer;}</style>"
         "<title>ESP32 Radio Config</title></head><body>"
-        "<h2>Configurazione WiFi</h2>"
+        "2<h2>Configurazione WiFi</h2>"
         "<form action='/save' method='POST'>"
         "<label>SSID</label><input type='text' name='ssid' required>"
         "<label>Password</label><input type='password' name='password'>"
@@ -383,11 +392,23 @@ void handleRoot() {
     );
     server.send(200, "text/html", html);
 }
-
 void handleSave() {
     if (server.hasArg("ssid")) {
         String reqSsid = server.arg("ssid");
         String reqPass = server.arg("password");
+
+        // Se siamo connessi e usiamo il form opzionale, recuperiamo i vecchi dati se i campi sono vuoti
+        if (currentState == STATE_STATIONS_CONFIG) {
+            // Se l'utente ha lasciato l'SSID vuoto, mantieni quello attuale in RAM/config
+            if (reqSsid.isEmpty()) {
+                reqSsid = wifiSsid;
+            }
+            // Se l'utente ha lasciato la Password vuota, mantieni quella attuale in RAM/config
+            if (reqPass.isEmpty()) {
+                reqPass = wifiPass;
+            }
+        }
+        // -------------------------------------------------------
 
         server.send(200, "text/html",
             F("<!DOCTYPE html><html><body>"
@@ -399,11 +420,21 @@ void handleSave() {
         markSkipSleepOnBoot();  // WA: al prossimo boot salta il ritorno in sleep (marker su flash)
         logSuSeriale(F("[AP] Riavvio in corso...\n"));
         ESP.restart();
+    } else if (currentState == STATE_STATIONS_CONFIG) {
+        // Se siamo in config stazioni, l'azione "Salva e Riavvia" (pulsante verde in fondo) 
+        // richiede solo il reboot salvando lo stato delle stazioni
+        server.send(200, "text/html",
+            F("<!DOCTYPE html><html><body>"
+              "<h3>Configurazione completata. Riavvio in corso...</h3>"
+              "</body></html>"));
+        delay(1000);
+        markSkipSleepOnBoot();
+        logSuSeriale(F("[CFG] Salvo ed esco. Riavvio in corso...\n"));
+        ESP.restart();
     } else {
         server.send(400, "text/plain", "Bad Request");
     }
 }
-
 // ─────────────────────────────────────────────────────────────────────────────
 // Callback audio
 // ─────────────────────────────────────────────────────────────────────────────
@@ -414,7 +445,9 @@ void my_audio_info(Audio::msg_t m) {
         if (isSpeakingStation) {
             isSpeakingStation = false;
             logSuSeriale(F("[TTS] Fine annuncio: %s\n"), stations[currentStationIdx].name.c_str());
-            setLed(LED_GREEN);   // verde: riproduzione
+            if (!vuMeterAttivo) {
+                setLed(LED_GREEN);   // verde: riproduzione (solo se VU-Meter disattivato)
+            }
             if (!audio.connecttohost(stations[currentStationIdx].url.c_str()))
                 ESP.restart();
         }
@@ -487,6 +520,44 @@ void setup() {
     });
     btnVolume.setPressMs(AP_LONGPRESS_MS);
 
+    // ── Pulsante encoder stazioni ─────────────────────────────────────────────
+    pinMode(PIN_ST_SW, INPUT_PULLUP);
+
+    // MODIFICA: CLICK BREVE → Attiva / Disattiva il VU-Meter
+    btnStazioni.attachClick([]() {
+        if (currentState == STATE_PLAYER) {
+            vuMeterAttivo = !vuMeterAttivo;
+            logSuSeriale(F("[BTN] Click breve stazioni: VU-Meter %s\n"), vuMeterAttivo ? "ATTIVATO" : "DISATTIVATO");
+            if (!vuMeterAttivo && !isSpeakingStation) {
+                setLed(LED_GREEN); // Ripristina LED verde fisso se disattiviamo il VU-meter
+            }
+        }
+    });
+
+    // Pressione prolungata (>= AP_LONGPRESS_MS) da accesi → apre l'editor web
+    // delle stazioni sulla rete locale.
+    btnStazioni.attachLongPressStart([]() {
+        if (currentState == STATE_PLAYER) {
+            logSuSeriale(F("[BTN] Pressione prolungata stazioni: configurazione radio ed editor web\n"));
+            audio.stopSong();
+            isSpeakingStation = false;
+            hasPendingPlay    = false;
+            vuMeterAttivo     = false; // Disattiva VU-meter se entriamo in config
+
+            // Associa gli handler per l'editor stazioni
+            server.on("/",     HTTP_GET,  handleManageStations);
+            server.on("/add",  HTTP_POST, handleAddStation);
+            server.on("/delete", HTTP_GET, handleDeleteStation);
+            server.on("/save", HTTP_POST, handleSave);
+            server.begin();
+
+            logSuSeriale(F("[HTTP] Server gestione stazioni avviato su IP: %s\n"), WiFi.localIP().toString().c_str());
+            setLed(LED_CYAN); // Lascia il led fisso su Ciano (Annuncio/Config)
+            currentState = STATE_STATIONS_CONFIG;
+        }
+    });
+    btnStazioni.setPressMs(AP_LONGPRESS_MS);
+
     // ── BCLK drive strength (necessario con due MAX98357A in parallelo) ────────
     gpio_set_drive_capability((gpio_num_t)I2S_BCLK, GPIO_DRIVE_CAP_3);
 
@@ -550,6 +621,93 @@ void setup() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Gestione dinamica LED come barra VU-Meter basata sul livello (0-255)
+// ─────────────────────────────────────────────────────────────────────────────
+void aggiornaLedVuMeter(uint8_t livello) {
+    static uint8_t  ultimoLivello = 0;
+    static float    maxDinamico   = 120.0f; // Partiamo da un picco stimato basso
+    static uint32_t ultimoDecadimento = 0;
+
+    if (livello == ultimoLivello) {
+        return;
+    }
+    ultimoLivello = livello;
+
+    // 1. Se il livello attuale supera il massimo storico, aggiorna subito il picco
+    if (livello > maxDinamico) {
+        maxDinamico = livello;
+    }
+
+    // 2. Decadimento lento del picco massimo ogni 100ms
+    // Serve a riadattare la scala se la musica passa da un pezzo forte a uno piano
+    if (millis() - ultimoDecadimento > 100) {
+        if (maxDinamico > 80.0f) { // Non scendere sotto la soglia minima di rumore
+            maxDinamico -= 0.5f;   // Fa scendere il picco lentamente
+        }
+        ultimoDecadimento = millis();
+    }
+
+    // 3. Normalizza il valore letto in percentuale (0.0 -> 1.0) rispetto al max attuale
+    float percentuale = (float)livello / maxDinamico;
+    if (percentuale > 1.0f) percentuale = 1.0f;
+
+    uint8_t r = 0, g = 0, b = 0;
+
+    // 4. Soglie relative in percentuale:
+    //    0%  - 50%  -> VERDE
+    //    51% - 80%  -> GIALLO
+    //    81% - 100% -> ROSSO
+    if (percentuale <= 0.50f) {
+        // Fascia VERDE
+        g = (uint8_t)map(percentuale * 100, 0, 50, 30, 255);
+    } 
+    else if (percentuale <= 0.80f) {
+        // Fascia GIALLA (R + G)
+        uint8_t lux = (uint8_t)map(percentuale * 100, 51, 80, 100, 255);
+        r = lux;
+        g = lux;
+    } 
+    else {
+        // Fascia ROSSA (Picchi relativi)
+        r = (uint8_t)map(percentuale * 100, 81, 100, 180, 255);
+    }
+
+    rgb.setPixelColor(0, rgb.Color(r, g, b));
+    rgb.show();
+}
+/*void aggiornaLedVuMeter(uint8_t livello) {
+    static uint8_t ultimoLivello = 0;
+    
+    // Se il livello non è cambiato rispetto al loop precedente, esci subito
+    if (livello == ultimoLivello) {
+        return; 
+    }
+    logSuSeriale(F("[VU-METER] Livello audio: %d\n"), livello);
+    uint8_t r = 0, g = 0, b = 0;
+    ultimoLivello = livello;
+    if (livello <= 95) {
+        // Fascia VERDE: la luminosità (G) cresce linearmente da 0 a 255
+        // Rimappiamo il range 0-128 sul range di luminosità 0-255
+        g = map(livello, 0, 128, 0, 255);
+    } 
+    else if (livello <= 135) {
+        // Fascia GIALLA (Rosso + Verde): la luminosità cresce linearmente da 40 a 255
+        uint8_t lux = map(livello, 129, 199, 40, 255);
+        r = lux;
+        g = lux;
+    } 
+    else {
+        // Fascia ROSSA: la luminosità (R) cresce linearmente da 100 a 255
+        r = map(livello, 200, 255, 100, 255);
+    }
+
+    // Aggiorna il singolo pixel senza toccare la luminosità globale (setBrightness)
+    rgb.setPixelColor(0, rgb.Color(r, g, b));
+    rgb.show();
+}*/
+
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Loop
 // ─────────────────────────────────────────────────────────────────────────────
 void loop() {
@@ -561,7 +719,10 @@ void loop() {
             audio.setPinout(I2S_BCLK, I2S_LRC, I2S_DOUT);
             audio.setVolumeSteps(64);
             audio.setVolume(lastPos);  // volume ripristinato da flash
-
+            // ── EQUALIZZATORE TIPO "PURE EVOKE" ─────────────────────────────────
+            // audio.setTone(bassi, medi, alti) - Valori espressi in dB
+                audio.setTone(5, -4, 4);   
+            // ────────────────────────────────────────────────────────────────────
             if (loadWifiConfig()) {
                 // Define static IP details shoud make connection faster
                 IPAddress local_IP(192, 168, 1, 201);
@@ -593,6 +754,7 @@ void loop() {
         // ── ATTESA WIFI ───────────────────────────────────────────────────────
         case STATE_WAITWIFICONNECTION:
             btnVolume.tick();  // permette la pressione prolungata anche in questa fase
+            btnStazioni.tick();
             if (currentState == STATE_START_AP) break;  // richiesta AP appena arrivata: non sovrascriverla
             if (WiFi.status() != WL_CONNECTED) {
                 if (millis() - connectionStartTime > WIFI_TIMEOUT_MS) {
@@ -624,6 +786,8 @@ void loop() {
                 setLed(LED_CYAN);      // ciano: annuncio TTS stazione
                 isSpeakingStation = true;
                 ttsStartTime = millis();  // WA: avvio timer fallback annuncio TTS
+                audio.stopSong(); // Ferma qualsiasi cosa prima
+                delay(50);
                 audio.connecttospeech(stations[currentStationIdx].name.c_str(), stations[currentStationIdx].nameLang.c_str());
                 //audio.connecttohost(stations[currentStationIdx].url.c_str());
                 currentState = STATE_PLAYER;
@@ -681,6 +845,12 @@ void loop() {
             encoderVolume.tick();
             encoderStazioni.tick();
             btnVolume.tick();
+            btnStazioni.tick(); // <-- Rileva pressioni sul selettore stazione
+
+            // MODIFICA: Aggiorna il VU-meter solo se è stato abilitato dall'utente
+            if (vuMeterAttivo && !isSpeakingStation) { 
+                aggiornaLedVuMeter(audio.getVUlevel());
+            }
 
             // ── Salvataggio ritardato su flash ────────────────────────────────
             // Evita scritture continue durante la rotazione dell'encoder volume:
@@ -699,7 +869,8 @@ void loop() {
                 logSuSeriale(F("[TTS] Timeout annuncio, forzo passaggio allo stream: %s\n"),
                              stations[currentStationIdx].name.c_str());
                 audio.stopSong();
-                setLed(LED_GREEN);   // verde: riproduzione
+                delay(50);
+                if (!vuMeterAttivo) setLed(LED_GREEN);   // verde fisso solo se VU-meter spento
                 pendingUrl     = stations[currentStationIdx].url;
                 hasPendingPlay = true;
             }
@@ -762,6 +933,19 @@ void loop() {
             break;
         }
 
+        // ── CONFIGURAZIONE STAZIONI (DA CONNESSI) ─────────────────────────────
+        case STATE_STATIONS_CONFIG:
+            btnVolume.tick();      // Permette di rientrare in sleep anche in config
+            server.handleClient(); // Gestisce le modifiche web alle stazioni
+            // Blink ciano per indicare config attiva
+            if (millis() - lastBlinkTime >= 500) {
+                lastBlinkTime = millis();
+                blinkState = !blinkState;
+                setLed(blinkState ? LED_CYAN : LED_OFF);
+            }  
+            delay(2);
+            break;
+
         default:
             break;
     }
@@ -812,6 +996,300 @@ bool loadStations() {
 
     logSuSeriale(F("[CFG] Stazioni caricate: %d\n"), stations.size());
     return true;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Scrittura stazioni su LittleFS (JSON)
+// ─────────────────────────────────────────────────────────────────────────────
+bool saveStationsToFS() {
+    if (!LittleFS.begin(true)) {
+        logSuSeriale(F("[ERR] Impossibile avviare LittleFS per salvare\n"));
+        return false;
+    }
+
+    File f = LittleFS.open("/stations.json", "w");
+    if (!f) {
+        logSuSeriale(F("[ERR] Impossibile creare stations.json in scrittura\n"));
+        LittleFS.end();
+        return false;
+    }
+
+    JsonDocument doc;
+    JsonArray arr = doc["stations"].to<JsonArray>();
+    for (const auto& s : stations) {
+        JsonObject obj = arr.add<JsonObject>();
+        obj["name"] = s.name;
+        obj["url"] = s.url;
+        obj["nameLang"] = s.nameLang;
+    }
+
+    if (serializeJson(doc, f) == 0) {
+        logSuSeriale(F("[ERR] Fallita la serializzazione stazioni\n"));
+        f.close();
+        LittleFS.end();
+        return false;
+    }
+
+    f.close();
+    LittleFS.end();
+    logSuSeriale(F("[CFG] stations.json aggiornato con successo\n"));
+    return true;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Escaping per iniettare stringhe utente dentro il letterale JS `let stations = [...]`
+// (name/url arrivano da un <input type=text>: possono contenere ", \ o backtick)
+// ─────────────────────────────────────────────────────────────────────────────
+String jsonEscape(const String& s) {
+    String out;
+    out.reserve(s.length());
+    for (size_t i = 0; i < s.length(); i++) {
+        char c = s[i];
+        switch (c) {
+            case '"':  out += "\\\""; break;
+            case '\\': out += "\\\\"; break;
+            case '`':  out += "\\`";  break;
+            case '\n': out += "\\n";  break;
+            case '\r': break;  // scartato
+            default:   out += c;
+        }
+    }
+    return out;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Gestori WebServer dedicati alla modifica delle stazioni
+// ─────────────────────────────────────────────────────────────────────────────
+void handleManageStations() {
+    // Serializza la lista attuale in formato JSON array per passarla a JavaScript
+    // (nomi/url escapati: possono contenere caratteri digitati liberamente dall'utente)
+    String stationsJson = "[";
+    for (size_t i = 0; i < stations.size(); i++) {
+        stationsJson += "{\"name\":\"" + jsonEscape(stations[i].name) + "\",\"url\":\"" + jsonEscape(stations[i].url) + "\",\"lang\":\"" + jsonEscape(stations[i].nameLang) + "\"}";
+        if (i < stations.size() - 1) stationsJson += ",";
+    }
+    stationsJson += "]";
+
+    // Utilizziamo un unico blocco HTML statico con stringhe raw per evitare pesi di concatenazione
+    server.setContentLength(CONTENT_LENGTH_UNKNOWN);
+    server.send(200, "text/html", "");
+
+    // Blocco Head e Stili CSS (Mobile-First)
+    server.sendContent(R"raw(<!DOCTYPE html>
+<html lang='it'>
+<head>
+    <meta charset='UTF-8'>
+    <meta name='viewport' content='width=device-width, initial-scale=1.0, user-scalable=no'>
+    <title>Gestione Web Radio</title>
+    <style>
+        * { box-sizing: border-box; margin: 0; padding: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
+        body { background-color: #f4f5f7; color: #212529; padding: 16px; display: flex; flex-direction: column; align-items: center; }
+        .phone-wrapper { width: 100%; max-width: 480px; display: flex; flex-direction: column; gap: 16px; }
+        h2 { font-size: 1.4rem; color: #1e293b; text-align: center; margin: 8px 0; display: flex; align-items: center; justify-content: center; gap: 8px; }
+        h3 { font-size: 1.1rem; color: #334155; margin-bottom: 12px; border-bottom: 2px solid #e2e8f0; padding-bottom: 6px; }
+        .card { background: #ffffff; border-radius: 12px; padding: 16px; box-shadow: 0 4px 12px rgba(0,0,0,0.05); border: 1px solid #e2e8f0; }
+        label { display: block; font-size: 0.85rem; font-weight: 600; color: #64748b; margin-bottom: 4px; text-transform: uppercase; }
+        input[type="text"], input[type="password"] { width: 100%; padding: 12px; margin-bottom: 14px; border: 1px solid #cbd5e1; border-radius: 8px; font-size: 1rem; background-color: #f8fafc; -webkit-appearance: none; }
+        input[type="text"]:focus, input[type="password"]:focus { outline: none; border-color: #3b82f6; background-color: #ffffff; box-shadow: 0 0 0 3px rgba(59,130,246,0.15); }
+        button, .btn { display: inline-flex; align-items: center; justify-content: center; width: 100%; padding: 14px; border: none; border-radius: 8px; font-size: 1rem; font-weight: 600; cursor: pointer; text-decoration: none; }
+        button:active, .btn:active { transform: scale(0.98); }
+        .btn-blue { background-color: #3b82f6; color: white; }
+        .btn-green { background-color: #10b981; color: white; box-shadow: 0 4px 6px rgba(16,185,129,0.2); }
+        .btn-orange { background-color: #f59e0b; color: white; padding: 8px 12px; font-size: 0.85rem; border-radius: 6px; width: auto; }
+        .btn-red { background-color: #ef4444; color: white; padding: 8px 12px; font-size: 0.85rem; border-radius: 6px; width: auto; }
+        .btn-cancel { background-color: #94a3b8; color: white; margin-top: -6px; margin-bottom: 12px; padding: 10px; font-size: 0.9rem; }
+        .station-item { display: flex; align-items: center; justify-content: space-between; padding: 12px 0; border-bottom: 1px solid #f1f5f9; gap: 12px; }
+        .station-item:last-child { border-bottom: none; }
+        .station-info { display: flex; flex-direction: column; gap: 2px; min-width: 0; flex-grow: 1; }
+        .station-name { font-weight: 600; font-size: 1rem; color: #1e293b; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+        .station-details { font-size: 0.8rem; color: #64748b; display: flex; align-items: center; gap: 6px; }
+        .lang-badge { background-color: #e2e8f0; color: #475569; padding: 2px 6px; border-radius: 4px; font-weight: bold; font-size: 0.75rem; text-transform: uppercase; }
+        .station-url { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 140px; }
+        .action-buttons { display: flex; gap: 6px; flex-shrink: 0; }
+        #empty-label { text-align: center; color: #94a3b8; padding: 20px 0; font-style: italic; }
+    </style>
+</head>
+<body>
+<div class='phone-wrapper'>
+    <h2>📻 Gestione Web Radio</h2>
+    
+    <div class='card'>
+        <h3>⚙️ Cambia Rete WiFi (Opzionale)</h3>
+        <form action='/save' method='POST'>
+            <label for='ssid'>Nuovo SSID</label>
+            <input type='text' id='ssid' name='ssid' placeholder='Lascia vuoto per non cambiare' autocomplete='off'>
+            <label for='password'>Nuova Password</label>
+            <input type='password' id='password' name='password' placeholder='Lascia vuoto per non cambiare'>
+            <button type='submit' class='btn btn-blue' style='padding: 10px; font-size: 0.9rem; background-color: #475569;'>🔄 Aggiorna solo WiFi e Riavvia</button>
+        </form>
+    </div>
+
+    <div class='card'>
+        <h3 id='form-title'>➕ Nuova Radio</h3>
+        <form id='add-form' action='/add' method='POST'>
+            <input type='hidden' name='edit_id' id='edit-id' value=''>
+            <label for='name'>Nome Stazione</label>
+            <input type='text' id='name' name='name' required placeholder='es. Radio Capital' autocomplete='off'>
+            
+            <label for='url'>URL Stream</label>
+            <input type='text' id='url' name='url' required placeholder='es. http://...' autocomplete='off'>
+            
+            <label for='lang'>Lingua TTS</label>
+            <input type='text' id='lang' name='lang' value='it' required autocomplete='off'>
+            
+            <button type='submit' id='submit-btn' class='btn btn-blue'>Aggiungi Stazione</button>
+        </form>
+        <button id='cancel-btn' class='btn btn-cancel' style='display: none;' onclick='resetForm()'>Annulla Modifica</button>
+    </div>
+
+    <div class='card'>
+        <h3>📜 Stazioni in Memoria</h3>
+        <div id='stations-list'></div>
+    </div>
+
+    <div style='margin-top: 8px;'>
+        <form action='/save' method='POST'>
+            <button type='submit' class='btn btn-green'>💾 Salva ed Esci (Riavvia)</button>
+        </form>
+    </div>
+</div>
+)raw");
+
+    // Inietta l'array JSON calcolato dinamicamente dall'ESP32 (già escapato in jsonEscape())
+    server.sendContent("\n<script>\nlet stations = " + stationsJson + ";\n");
+
+    // Blocco logica client-side in JS per riempire la lista e gestire il ripopolamento del form per la modifica.
+    // Costruzione via DOM (createElement/textContent), non innerHTML: evita che caratteri
+    // come < o > digitati dall'utente in nome/url vengano interpretati come markup.
+    server.sendContent(R"raw(
+    function renderStations() {
+        const listDiv = document.getElementById('stations-list');
+        listDiv.innerHTML = '';
+        if (stations.length === 0) {
+            listDiv.innerHTML = '<div id="empty-label">Nessuna radio in memoria</div>';
+            return;
+        }
+        stations.forEach((station, index) => {
+            const item = document.createElement('div');
+            item.className = 'station-item';
+
+            const info = document.createElement('div');
+            info.className = 'station-info';
+            const nameEl = document.createElement('span');
+            nameEl.className = 'station-name';
+            nameEl.textContent = station.name;
+            const details = document.createElement('span');
+            details.className = 'station-details';
+            const badge = document.createElement('span');
+            badge.className = 'lang-badge';
+            badge.textContent = station.lang;
+            const urlEl = document.createElement('span');
+            urlEl.className = 'station-url';
+            urlEl.title = station.url;
+            urlEl.textContent = station.url;
+            details.appendChild(badge);
+            details.appendChild(urlEl);
+            info.appendChild(nameEl);
+            info.appendChild(details);
+
+            const actions = document.createElement('div');
+            actions.className = 'action-buttons';
+            const editBtn = document.createElement('button');
+            editBtn.className = 'btn btn-orange';
+            editBtn.textContent = 'Modifica';
+            editBtn.onclick = () => startEdit(index);
+            const delBtn = document.createElement('a');
+            delBtn.className = 'btn btn-red';
+            delBtn.href = '/delete?id=' + index;
+            delBtn.textContent = 'Elimina';
+            delBtn.onclick = () => confirm('Eliminare "' + station.name + '"?');
+            actions.appendChild(editBtn);
+            actions.appendChild(delBtn);
+
+            item.appendChild(info);
+            item.appendChild(actions);
+            listDiv.appendChild(item);
+        });
+    }
+
+    function startEdit(index) {
+        const station = stations[index];
+        document.getElementById('name').value = station.name;
+        document.getElementById('url').value = station.url;
+        document.getElementById('lang').value = station.lang;
+        document.getElementById('edit-id').value = index;
+
+        document.getElementById('form-title').innerText = "✏️ Modifica Radio";
+        document.getElementById('submit-btn').innerText = "Aggiorna Stazione";
+        document.getElementById('submit-btn').className = "btn btn-orange";
+        document.getElementById('cancel-btn').style.display = "block";
+        window.scrollTo({ top: 0, behavior: 'smooth' });
+    }
+
+    function resetForm() {
+        document.getElementById('name').value = '';
+        document.getElementById('url').value = '';
+        document.getElementById('lang').value = 'it';
+        document.getElementById('edit-id').value = '';
+
+        document.getElementById('form-title').innerText = "➕ Nuova Radio";
+        document.getElementById('submit-btn').innerText = "Aggiungi Stazione";
+        document.getElementById('submit-btn').className = "btn btn-blue";
+        document.getElementById('cancel-btn').style.display = "none";
+    }
+
+    renderStations();
+</script>
+</body>
+</html>
+)raw");
+
+    server.sendContent(""); // Chiude l'invio
+}
+
+void handleAddStation() {
+    if (server.hasArg("name") && server.hasArg("url") && server.hasArg("lang")) {
+        String name = server.arg("name");
+        String url = server.arg("url");
+        String lang = server.arg("lang");
+        String editIdStr = server.arg("edit_id");
+
+        if (!editIdStr.isEmpty()) {
+            // Se edit_id è popolato stiamo sovrascrivendo una stazione esistente
+            int editId = editIdStr.toInt();
+            if (editId >= 0 && editId < (int)stations.size()) {
+                stations[editId] = {name, url, lang};
+                logSuSeriale(F("[CFG] Stazione %d modificata: %s\n"), editId, name.c_str());
+            }
+        } else {
+            // Altrimenti si tratta di un inserimento standard
+            stations.push_back({name, url, lang});
+            logSuSeriale(F("[CFG] Nuova stazione aggiunta: %s\n"), name.c_str());
+        }
+
+        saveStationsToFS(); // Aggiorna LittleFS
+
+        // Redirect automatico alla pagina di configurazione stazioni
+        server.sendHeader("Location", "/");
+        server.send(303, "text/plain", "Redirecting...");
+    } else {
+        server.send(400, "text/plain", "Bad Request");
+    }
+}
+
+void handleDeleteStation() {
+    if (server.hasArg("id")) {
+        int id = server.arg("id").toInt();
+        if (id >= 0 && id < (int)stations.size()) {
+            logSuSeriale(F("[CFG] Elimino stazione %d: %s\n"), id, stations[id].name.c_str());
+            stations.erase(stations.begin() + id);
+            saveStationsToFS(); // Aggiorna LittleFS
+        }
+        server.sendHeader("Location", "/");
+        server.send(303, "text/plain", "Redirecting...");
+    } else {
+        server.send(400, "text/plain", "Bad Request");
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
