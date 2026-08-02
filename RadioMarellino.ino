@@ -8,6 +8,7 @@
 #include <Adafruit_NeoPixel.h>
 #include <vector>
 #include "esp_sleep.h"
+#include <ESPmDNS.h>
 
 // ── Struttura stazione ────────────────────────────────────────────────────────
 struct Station {
@@ -58,13 +59,16 @@ Adafruit_NeoPixel rgb(NUM_LEDS, PIN_LED_RGB, NEO_GRB + NEO_KHZ800);
 // ── GPIO wakeup deep sleep ────────────────────────────────────────────────────
 #define SLEEP_WAKEUP_GPIO  GPIO_NUM_9
 
-// ── Soglia pressione prolungata pulsante → ingresso modalità AP ──────────────
-#define AP_LONGPRESS_MS  3000
+// ── Soglia pressione prolungata pulsante → ciclo preset ──────────────────────
+#define PRESET_LONGPRESS_MS  500
+// ── Soglia pressione molto prolungata pulsante → ingresso modalità AP ────────
+#define AP_LONGPRESS_MS      4000
 
 // ── RTC memory: sopravvive al deep sleep ──────────────────────────────────────
-RTC_DATA_ATTR int rtcStationIdx = 0;
-RTC_DATA_ATTR int rtcVolume     = VOLUME_DEFAULT;
-RTC_DATA_ATTR int rtcWifiPowerIdx = 0;
+RTC_DATA_ATTR int rtcStationIdx    = 0;
+RTC_DATA_ATTR int rtcVolume        = VOLUME_DEFAULT;
+RTC_DATA_ATTR int rtcWifiPowerIdx  = 0;
+RTC_DATA_ATTR int rtcPresetIdx     = 0;
 
 // ── Parametri Equalizzatore ───────────────────────────────────────────────────
 float eqLow  = 0.0f;
@@ -85,6 +89,28 @@ TubeConfig tubeParams;
 // Stato interno del filtro
 float lastSampleL = 0.0f;
 float lastSampleR = 0.0f;
+
+// ── Preset audio hardcoded (speculari alla WebUI) ─────────────────────────────
+struct AudioPreset {
+    const char* name;
+    float low;
+    float mid;
+    float high;
+    float drive;
+    float cutoffAlpha;
+    float makeUpGain;
+    uint32_t ledColor;  // colore feedback LED
+};
+
+const AudioPreset audioPresets[] = {
+    { "Flat",            0.0f,  0.0f,  0.0f, 1.0f,  1.0f,  1.0f, 0xFFFFFF },  // bianco
+    { "Pure Evoke",      5.0f, -4.0f,  4.0f, 1.0f,  1.0f,  1.1f, 0x00BFFF },  // azzurro
+    { "Pure Evoke Valvolare", 5.0f, -4.0f, 4.0f, 1.2f, 0.4f, 1.1f, 0xFF8C00 }, // arancio
+    { "Warm Vintage",    3.0f,  1.0f, -1.0f, 1.25f, 0.3f,  1.1f, 0xFFD700 },  // oro
+    { "Rock Overdrive",  4.0f, -1.0f,  3.5f, 1.35f, 0.45f, 1.0f, 0xFF0000 },  // rosso
+    { "Parlato",        -3.0f,  4.0f, -2.0f, 1.0f,  1.0f,  1.0f, 0x8A2BE2 },  // viola
+};
+const int NUM_PRESETS = sizeof(audioPresets) / sizeof(audioPresets[0]);
 
 // ── State machine ─────────────────────────────────────────────────────────────
 enum MachineStates {
@@ -112,6 +138,7 @@ OneButton     btnStazioni(PIN_ST_SW, true, true);
 int lastPos           = -1;
 int lastStPos         = 0;
 int currentStationIdx = 0;
+int currentPresetIdx  = 0;
 bool vuMeterAttivo    = false;  
 
 // ── Credenziali WiFi ──────────────────────────────────────────────────────────
@@ -143,6 +170,14 @@ unsigned long lastSaveTime  = 0;
 bool          pendingSave   = false;
 const unsigned long SAVE_DEBOUNCE_MS = 2000;  
 
+// ── Timer e contatore lampeggi feedback preset ────────────────────────────────
+unsigned long presetBlinkTimer   = 0;
+int           presetBlinkCount   = 0;
+int           presetBlinkTarget  = 0;
+bool          presetBlinkPhase   = false;  // true=acceso, false=spento
+bool          presetBlinkActive  = false;
+const unsigned long PRESET_BLINK_MS = 150;
+
 // ── Prototipi ─────────────────────────────────────────────────────────────────
 void logSuSeriale(const __FlashStringHelper *frmt, ...);
 bool loadStations();
@@ -163,6 +198,9 @@ void handleSetEq();
 void markSkipSleepOnBoot();
 bool consumeSkipSleepFlag();
 void enterApModeFromButton();
+void applyPreset(int idx);
+void startPresetBlinkFeedback(int idx);
+void tickPresetBlink();
 String jsonEscape(const String& s);
 void aggiornaLedVuMeter(uint8_t livello);
 
@@ -172,6 +210,56 @@ void aggiornaLedVuMeter(uint8_t livello);
 void setLed(uint32_t color) {
     rgb.setPixelColor(0, color);
     rgb.show();
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Applicazione preset audio
+// ─────────────────────────────────────────────────────────────────────────────
+void applyPreset(int idx) {
+    if (idx < 0 || idx >= NUM_PRESETS) return;
+    eqLow  = audioPresets[idx].low;
+    eqMid  = audioPresets[idx].mid;
+    eqHigh = audioPresets[idx].high;
+    tubeParams.drive       = audioPresets[idx].drive;
+    tubeParams.cutoffAlpha = audioPresets[idx].cutoffAlpha;
+    tubeParams.makeUpGain  = audioPresets[idx].makeUpGain;
+    audio.setTone(eqLow, eqMid, eqHigh);
+    logSuSeriale(F("[PRESET] Applicato: %s (idx=%d)\n"), audioPresets[idx].name, idx);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Feedback LED lampeggi preset (non bloccante)
+// ─────────────────────────────────────────────────────────────────────────────
+void startPresetBlinkFeedback(int idx) {
+    if (idx < 0 || idx >= NUM_PRESETS) return;
+    presetBlinkTarget = idx + 1;  // numero di lampeggi = indice + 1
+    presetBlinkCount  = 0;
+    presetBlinkPhase  = true;
+    presetBlinkActive = true;
+    presetBlinkTimer  = millis();
+    rgb.setPixelColor(0, audioPresets[idx].ledColor);
+    rgb.show();
+}
+
+void tickPresetBlink() {
+    if (!presetBlinkActive) return;
+    if (millis() - presetBlinkTimer < PRESET_BLINK_MS) return;
+    presetBlinkTimer = millis();
+
+    if (presetBlinkPhase) {
+        setLed(LED_OFF);
+        presetBlinkPhase = false;
+    } else {
+        presetBlinkCount++;
+        if (presetBlinkCount >= presetBlinkTarget) {
+            presetBlinkActive = false;
+            if (!vuMeterAttivo && !isSpeakingStation) setLed(LED_GREEN);
+        } else {
+            rgb.setPixelColor(0, audioPresets[currentPresetIdx].ledColor);
+            rgb.show();
+            presetBlinkPhase = true;
+        }
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -195,6 +283,7 @@ void loadState() {
         rtcStationIdx   = doc["station"] | 0;
         rtcVolume       = doc["volume"]  | VOLUME_DEFAULT;
         rtcWifiPowerIdx = doc["wifi_power_idx"] | 0;
+        rtcPresetIdx    = doc["preset_idx"] | 0;
         eqLow           = doc["eq_low"]  | 0.0f;
         eqMid           = doc["eq_mid"]  | 0.0f;
         eqHigh          = doc["eq_high"] | 0.0f;
@@ -203,8 +292,8 @@ void loadState() {
         tubeParams.cutoffAlpha = doc["tube_cutoff"] | 1.0f;
         tubeParams.makeUpGain  = doc["tube_gain"]   | 1.0f;
 
-        logSuSeriale(F("[STATE] Caricato da flash: stazione=%d, vol=%d, EQ=(%.1f,%.1f,%.1f), Tube=(%.2f,%.2f,%.2f)\n"),
-                     rtcStationIdx, rtcVolume, eqLow, eqMid, eqHigh, 
+        logSuSeriale(F("[STATE] Caricato da flash: stazione=%d, vol=%d, preset=%d, EQ=(%.1f,%.1f,%.1f), Tube=(%.2f,%.2f,%.2f)\n"),
+                     rtcStationIdx, rtcVolume, rtcPresetIdx, eqLow, eqMid, eqHigh, 
                      tubeParams.drive, tubeParams.cutoffAlpha, tubeParams.makeUpGain);
     } else {
         logSuSeriale(F("[STATE] Errore parsing state.json\n"));
@@ -231,6 +320,7 @@ void saveState() {
     doc["station"]        = currentStationIdx;
     doc["volume"]         = lastPos;
     doc["wifi_power_idx"] = uiRetry;
+    doc["preset_idx"]     = currentPresetIdx;
     doc["eq_low"]         = eqLow;
     doc["eq_mid"]         = eqMid;
     doc["eq_high"]        = eqHigh;
@@ -243,8 +333,8 @@ void saveState() {
     f.close();
     LittleFS.end();
 
-    logSuSeriale(F("[STATE] Salvato su flash: stazione=%d, vol=%d, EQ=(%.1f,%.1f,%.1f), Tube=(%.2f,%.2f,%.2f)\n"),
-                 currentStationIdx, lastPos, eqLow, eqMid, eqHigh,
+    logSuSeriale(F("[STATE] Salvato su flash: stazione=%d, vol=%d, preset=%d, EQ=(%.1f,%.1f,%.1f), Tube=(%.2f,%.2f,%.2f)\n"),
+                 currentStationIdx, lastPos, currentPresetIdx, eqLow, eqMid, eqHigh,
                  tubeParams.drive, tubeParams.cutoffAlpha, tubeParams.makeUpGain);
 }
 
@@ -290,6 +380,7 @@ void goToDeepSleep() {
     rtcStationIdx = currentStationIdx;
     rtcVolume     = (lastPos >= ROTARYMIN) ? lastPos : VOLUME_DEFAULT;
     rtcWifiPowerIdx = uiRetry;
+    rtcPresetIdx  = currentPresetIdx;
 
     saveState();
     audio.stopSong();
@@ -441,6 +532,7 @@ void setup() {
     audio.setTone(eqLow, eqMid, eqHigh);
 
     currentStationIdx = rtcStationIdx;
+    currentPresetIdx  = rtcPresetIdx;
     int startVolume   = rtcVolume;
     uiRetry           = rtcWifiPowerIdx;
 
@@ -451,9 +543,19 @@ void setup() {
     lastStPos = currentStationIdx;
 
     pinMode(PIN_SW, INPUT_PULLUP);
+    btnVolume.setPressMs(PRESET_LONGPRESS_MS);
     btnVolume.attachClick([]() { goToDeepSleep(); });
-    btnVolume.attachLongPressStart([]() { enterApModeFromButton(); });
-    btnVolume.setPressMs(AP_LONGPRESS_MS);
+    btnVolume.attachLongPressStop([]() {
+        if (btnVolume.getPressedMs() >= AP_LONGPRESS_MS) {
+            enterApModeFromButton();
+        } else if (currentState == STATE_PLAYER) {
+            currentPresetIdx = (currentPresetIdx + 1) % NUM_PRESETS;
+            applyPreset(currentPresetIdx);
+            rtcPresetIdx = currentPresetIdx;
+            scheduleSave();
+            startPresetBlinkFeedback(currentPresetIdx);
+        }
+    });
 
     pinMode(PIN_ST_SW, INPUT_PULLUP);
 
@@ -542,27 +644,22 @@ void loop() {
     switch (currentState) {
 
         case STATE_INIT:
-            if (loadWifiConfig()) {
-                IPAddress local_IP(192, 168, 1, 201);
-                IPAddress gateway(192, 168, 1, 1);
-                IPAddress subnet(255, 255, 255, 0);
-                IPAddress primaryDNS(192, 168, 1, 1);                 
-                setLed(LED_YELLOW);
-                WiFi.disconnect(true, true); 
-                delay(100);
-                WiFi.setAutoReconnect(false);
-                delay(100);
-                WiFi.mode(WIFI_STA);
-                delay(100);
-                WiFi.config(local_IP, gateway, subnet, primaryDNS);
-                WiFi.begin(wifiSsid.c_str(), wifiPass.c_str());
-                connectionStartTime = millis();
-                currentState = STATE_WAITWIFICONNECTION;
-                WiFi.setTxPower(wifiPWR[uiRetry]);
-            } else {
-                currentState = STATE_START_AP;
-            }
-            break;
+        if (loadWifiConfig()) {
+            setLed(LED_YELLOW);
+            WiFi.disconnect(true, true);
+            delay(100);
+            WiFi.setAutoReconnect(false);
+            delay(100);
+            WiFi.mode(WIFI_STA);
+            delay(100);
+            WiFi.begin(wifiSsid.c_str(), wifiPass.c_str());
+            connectionStartTime = millis();
+            currentState = STATE_WAITWIFICONNECTION;
+            WiFi.setTxPower(wifiPWR[uiRetry]);
+        } else {
+            currentState = STATE_START_AP;
+        }
+        break;
 
         case STATE_WAITWIFICONNECTION:
             btnVolume.tick();
@@ -586,7 +683,12 @@ void loop() {
                     rtcWifiPowerIdx = uiRetry;
                     saveState();
                 }
-
+                if (MDNS.begin("ESPRetroRadio")) {
+                    logSuSeriale(F("[MDNS] Avviato: ESPRetroRadio.local\n"));
+                    MDNS.addService("http", "tcp", 80);
+                } else {
+                    logSuSeriale(F("[MDNS] Avvio fallito\n"));
+                }
                 setLed(LED_CYAN);
                 isSpeakingStation = true;
                 ttsStartTime = millis();
@@ -640,9 +742,11 @@ void loop() {
             btnVolume.tick();
             btnStazioni.tick();
 
-            if (vuMeterAttivo && !isSpeakingStation) { 
+            if (vuMeterAttivo && !isSpeakingStation && !presetBlinkActive) { 
                 aggiornaLedVuMeter(audio.getVUlevel());
             }
+
+            tickPresetBlink();
 
             if (pendingSave && (millis() - lastSaveTime >= SAVE_DEBOUNCE_MS)) {
                 pendingSave = false;
