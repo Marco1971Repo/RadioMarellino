@@ -75,6 +75,20 @@ float eqLow  = 0.0f;
 float eqMid  = 0.0f;
 float eqHigh = 0.0f;
 
+// ==========================================
+// PARAMETRI TUBE DSP (Simulazione Valvolare)
+// ==========================================
+struct TubeConfig {
+    float drive = 1.0f;         // 1.0 = Clean/Spento
+    float cutoffAlpha = 1.0f;   
+    float makeUpGain = 1.0f;    
+};
+
+TubeConfig tubeParams;
+
+// Stato interno del filtro
+float lastSampleL = 0.0f;
+float lastSampleR = 0.0f;
 
 // ── Preset audio hardcoded (speculari alla WebUI) ─────────────────────────────
 struct AudioPreset {
@@ -82,17 +96,20 @@ struct AudioPreset {
     float low;
     float mid;
     float high;
+    float drive;
+    float cutoffAlpha;
+    float makeUpGain;
     uint32_t ledColor;  // colore feedback LED
 };
 
 const AudioPreset audioPresets[] = {
-    { "Flat",            0.0f,  0.0f,  0.0f, 0xFFFFFF },  // bianco
-    { "Pure Evoke",      5.0f, -4.0f,  4.0f, 0x00BFFF },  // azzurro
-    { "Warm Vintage",    3.0f,  1.0f, -1.0f, 0xFFD700 },  // oro
-    { "Rock Overdrive",  4.0f, -1.0f,  3.5f, 0xFF0000 },  // rosso
-    { "Parlato",        -3.0f,  4.0f, -2.0f, 0x8A2BE2 },  // viola
+    { "Flat",            0.0f,  0.0f,  0.0f, 1.0f,  1.0f,  1.0f, 0xFFFFFF },  // bianco
+    { "Pure Evoke",      5.0f, -4.0f,  4.0f, 1.0f,  1.0f,  1.1f, 0x00BFFF },  // azzurro
+    { "Pure Evoke Valvolare", 5.0f, -4.0f, 4.0f, 1.2f, 0.4f, 1.1f, 0xFF8C00 }, // arancio
+    { "Warm Vintage",    3.0f,  1.0f, -1.0f, 1.25f, 0.3f,  1.1f, 0xFFD700 },  // oro
+    { "Rock Overdrive",  4.0f, -1.0f,  3.5f, 1.35f, 0.45f, 1.0f, 0xFF0000 },  // rosso
+    { "Parlato",        -3.0f,  4.0f, -2.0f, 1.0f,  1.0f,  1.0f, 0x8A2BE2 },  // viola
 };
-
 const int NUM_PRESETS = sizeof(audioPresets) / sizeof(audioPresets[0]);
 
 // ── State machine ─────────────────────────────────────────────────────────────
@@ -142,7 +159,7 @@ bool   isSpeakingStation = false;
 
 // ── WA: timer fallback fine annuncio TTS ──────────────────────────────────────
 unsigned long ttsStartTime  = 0;
-const unsigned long TTS_TIMEOUT_MS = 15000;  
+const unsigned long TTS_TIMEOUT_MS = 8000;  
 
 // ── Lampeggio LED in AP mode ──────────────────────────────────────────────────
 unsigned long lastBlinkTime = 0;
@@ -203,6 +220,9 @@ void applyPreset(int idx) {
     eqLow  = audioPresets[idx].low;
     eqMid  = audioPresets[idx].mid;
     eqHigh = audioPresets[idx].high;
+    tubeParams.drive       = audioPresets[idx].drive;
+    tubeParams.cutoffAlpha = audioPresets[idx].cutoffAlpha;
+    tubeParams.makeUpGain  = audioPresets[idx].makeUpGain;
     audio.setTone(eqLow, eqMid, eqHigh);
     logSuSeriale(F("[PRESET] Applicato: %s (idx=%d)\n"), audioPresets[idx].name, idx);
 }
@@ -268,8 +288,13 @@ void loadState() {
         eqMid           = doc["eq_mid"]  | 0.0f;
         eqHigh          = doc["eq_high"] | 0.0f;
         
-        logSuSeriale(F("[STATE] Caricato da flash: stazione=%d, vol=%d, preset=%d, EQ=(%.1f,%.1f,%.1f), wifi_power_idx=%d\n"),
-                     rtcStationIdx, rtcVolume, rtcPresetIdx, eqLow, eqMid, eqHigh, rtcWifiPowerIdx);
+        tubeParams.drive       = doc["tube_drive"]  | 1.0f;
+        tubeParams.cutoffAlpha = doc["tube_cutoff"] | 1.0f;
+        tubeParams.makeUpGain  = doc["tube_gain"]   | 1.0f;
+
+        logSuSeriale(F("[STATE] Caricato da flash: stazione=%d, vol=%d, preset=%d, EQ=(%.1f,%.1f,%.1f), Tube=(%.2f,%.2f,%.2f)\n"),
+                     rtcStationIdx, rtcVolume, rtcPresetIdx, eqLow, eqMid, eqHigh, 
+                     tubeParams.drive, tubeParams.cutoffAlpha, tubeParams.makeUpGain);
     } else {
         logSuSeriale(F("[STATE] Errore parsing state.json\n"));
     }
@@ -300,12 +325,17 @@ void saveState() {
     doc["eq_mid"]         = eqMid;
     doc["eq_high"]        = eqHigh;
     
+    doc["tube_drive"]  = tubeParams.drive;
+    doc["tube_cutoff"] = tubeParams.cutoffAlpha;
+    doc["tube_gain"]   = tubeParams.makeUpGain;
+
     serializeJson(doc, f);
     f.close();
     LittleFS.end();
 
-    logSuSeriale(F("[STATE] Salvato su flash: stazione=%d, vol=%d, preset=%d, EQ=(%.1f,%.1f,%.1f), wifi_power_idx=%d\n"),
-                 currentStationIdx, lastPos, currentPresetIdx, eqLow, eqMid, eqHigh, uiRetry);
+    logSuSeriale(F("[STATE] Salvato su flash: stazione=%d, vol=%d, preset=%d, EQ=(%.1f,%.1f,%.1f), Tube=(%.2f,%.2f,%.2f)\n"),
+                 currentStationIdx, lastPos, currentPresetIdx, eqLow, eqMid, eqHigh,
+                 tubeParams.drive, tubeParams.cutoffAlpha, tubeParams.makeUpGain);
 }
 
 void scheduleSave() {
@@ -459,12 +489,9 @@ void my_audio_info(Audio::msg_t m) {
     if (m.e == Audio::evt_eof) {
         if (isSpeakingStation) {
             isSpeakingStation = false;
-            //hasPendingPlay = true;
             if (!vuMeterAttivo) setLed(LED_GREEN);
-            logSuSeriale(F("Qui: %s\n"), stations[currentStationIdx].url.c_str());
             if (!audio.connecttohost(stations[currentStationIdx].url.c_str()))
                 ESP.restart();
-            logSuSeriale(F("qui\n"));
         }
     }     
 }
@@ -550,7 +577,7 @@ void setup() {
 
             server.on("/",       HTTP_GET,  handleManageStations);
             server.on("/add",    HTTP_POST, handleAddStation);
-            server.on("/delete", HTTP_GET,  handleDeleteStation);
+            server.on("/delete", HTTP_POST, handleDeleteStation);
             server.on("/seteq",  HTTP_POST, handleSetEq);
             server.on("/save",   HTTP_POST, handleSave);
             server.begin();
@@ -565,13 +592,18 @@ void setup() {
 
     loadStations();
 
-    if (!stations.empty() && currentStationIdx >= (int)stations.size())
-        currentStationIdx = 0;
+    if (!stations.empty()) {
+        if (currentStationIdx >= (int)stations.size()) {
+            currentStationIdx = 0;
+        }
+    } else {
+        logSuSeriale(F("[WARN] Nessuna stazione disponibile in memoria.\n"));
+    }
 
-    wifiPWR[10]=WIFI_POWER_19_5dBm; wifiPWR[9]=WIFI_POWER_19dBm; wifiPWR[8]=WIFI_POWER_18_5dBm;
-    wifiPWR[7]=WIFI_POWER_17dBm;   wifiPWR[6]=WIFI_POWER_15dBm; wifiPWR[5]=WIFI_POWER_13dBm;
-    wifiPWR[4]=WIFI_POWER_11dBm;   wifiPWR[3]=WIFI_POWER_8_5dBm;wifiPWR[2]=WIFI_POWER_7dBm;
-    wifiPWR[1]=WIFI_POWER_5dBm;    wifiPWR[0]=WIFI_POWER_2dBm;    
+    wifiPWR[0]=WIFI_POWER_19_5dBm; wifiPWR[1]=WIFI_POWER_19dBm; wifiPWR[2]=WIFI_POWER_18_5dBm;
+    wifiPWR[3]=WIFI_POWER_17dBm;   wifiPWR[4]=WIFI_POWER_15dBm; wifiPWR[5]=WIFI_POWER_13dBm;
+    wifiPWR[6]=WIFI_POWER_11dBm;   wifiPWR[7]=WIFI_POWER_8_5dBm;wifiPWR[8]=WIFI_POWER_7dBm;
+    wifiPWR[9]=WIFI_POWER_5dBm;    wifiPWR[10]=WIFI_POWER_2dBm;    
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -618,10 +650,6 @@ void loop() {
 
         case STATE_INIT:
         if (loadWifiConfig()) {
-            IPAddress local_IP(192, 168, 1, 201);
-            IPAddress gateway(192, 168, 1, 1);
-            IPAddress subnet(255, 255, 255, 0);
-            IPAddress primaryDNS(192, 168, 1, 1);  
             setLed(LED_YELLOW);
             WiFi.disconnect(true, true);
             delay(100);
@@ -629,7 +657,6 @@ void loop() {
             delay(100);
             WiFi.mode(WIFI_STA);
             delay(100);
-            WiFi.config(local_IP, gateway, subnet, primaryDNS);
             WiFi.begin(wifiSsid.c_str(), wifiPass.c_str());
             connectionStartTime = millis();
             currentState = STATE_WAITWIFICONNECTION;
@@ -658,20 +685,19 @@ void loop() {
                 }
             } else {
                 if (rtcWifiPowerIdx != uiRetry) {
-                    WiFi.setSleep(WIFI_PS_NONE); 
                     rtcWifiPowerIdx = uiRetry;
                     saveState();
                 }
-                /*if (MDNS.begin("ESPRetroRadio")) {
+                if (MDNS.begin("ESPRetroRadio")) {
                     logSuSeriale(F("[MDNS] Avviato: ESPRetroRadio.local\n"));
                     MDNS.addService("http", "tcp", 80);
                 } else {
                     logSuSeriale(F("[MDNS] Avvio fallito\n"));
-                }*/
+                }
                 setLed(LED_CYAN);
                 isSpeakingStation = true;
                 ttsStartTime = millis();
-                //audio.stopSong();
+                audio.stopSong();
                 delay(50);
                 audio.connecttospeech(stations[currentStationIdx].name.c_str(), stations[currentStationIdx].nameLang.c_str());
                 currentState = STATE_PLAYER;
@@ -722,7 +748,7 @@ void loop() {
             btnStazioni.tick();
 
             if (vuMeterAttivo && !isSpeakingStation && !presetBlinkActive) { 
-                //aggiornaLedVuMeter(audio.getVUlevel());
+                aggiornaLedVuMeter(audio.getVUlevel());
             }
 
             tickPresetBlink();
@@ -764,12 +790,16 @@ void loop() {
                 scheduleSave();
             }
 
+            // Gestione cambio stazione SBLOCCATA:
             int newStPos = encoderStazioni.getPosition();
             if (lastStPos != newStPos) {
-                if (isSpeakingStation) {
-                    encoderStazioni.setPosition(currentStationIdx);
-                    lastStPos = currentStationIdx;
-                } else if (!stations.empty()) {
+                if (!stations.empty()) {
+                    audio.stopSong();
+                    delay(30); // Piccola pausa per liberare il socket TCP
+                    
+                    isSpeakingStation = false;
+                    hasPendingPlay    = false;
+
                     if (newStPos > lastStPos)
                         currentStationIdx = (currentStationIdx + 1) % (int)stations.size();
                     else
@@ -781,10 +811,18 @@ void loop() {
                     scheduleSave();
 
                     setLed(LED_CYAN);
-                    isSpeakingStation = true;
                     ttsStartTime = millis();
-                    audio.connecttospeech(stations[currentStationIdx].name.c_str(),
-                                          stations[currentStationIdx].nameLang.c_str());
+                    
+                    // Tenta il TTS
+                    if (audio.connecttospeech(stations[currentStationIdx].name.c_str(), stations[currentStationIdx].nameLang.c_str())) {
+                        isSpeakingStation = true;
+                    } else {
+                        // Se il TTS fallisce subito, imposta il play differito nello stream radio
+                        isSpeakingStation = false;
+                        if (!vuMeterAttivo) setLed(LED_GREEN);
+                        pendingUrl     = stations[currentStationIdx].url;
+                        hasPendingPlay = true; 
+                    }
                 }
             }
 
@@ -812,29 +850,22 @@ void loop() {
 // Caricamento / Salvataggio stazioni
 // ─────────────────────────────────────────────────────────────────────────────
 bool loadStations() {
-    // 1. Inizializziamo LittleFS una sola volta
-    if (!LittleFS.begin(true)) {
-        logSuSeriale(F("[STATIONS] Impossibile montare LittleFS\n"));
-        return false;
-    }
+    if (!LittleFS.begin(true)) return false;
 
-    bool caricamentoRiuscito = false;
-
-    // 2. TENTATIVO DI LETTURA DA FLASH
+    // Tenta il caricamento da flash
     if (LittleFS.exists("/stations.json")) {
         File f = LittleFS.open("/stations.json", "r");
         if (f) {
             JsonDocument doc;
             DeserializationError err = deserializeJson(doc, f);
             f.close();
+            LittleFS.end();
 
             if (!err) {
                 JsonArray arr = doc["stations"].as<JsonArray>();
-                // Verifichiamo che l'array esista e non sia vuoto
                 if (!arr.isNull() && arr.size() > 0) {
                     stations.clear();
                     stations.reserve(arr.size());
-
                     for (JsonObject s : arr) {
                         stations.push_back({
                             s["name"].as<String>(),
@@ -842,25 +873,19 @@ bool loadStations() {
                             s["nameLang"] | "it"
                         });
                     }
-
                     logSuSeriale(F("[STATIONS] Caricate %d stazioni da LittleFS\n"), stations.size());
-                    caricamentoRiuscito = true;
+                    return true;
                 }
-            } else {
-                logSuSeriale(F("[STATIONS] Errore nel parsing del JSON: %s\n"), err.c_str());
             }
+        } else {
+            LittleFS.end();
         }
-    }
-
-    // 3. SE LA LETTURA È ANDATA A BUON FINE
-    // Chiudiamo il file system e usciamo
-    if (caricamentoRiuscito) {
+    } else {
         LittleFS.end();
-        return true;
     }
 
-    // 4. FALLBACK (File non trovato, vuoto o corrotto)
-    logSuSeriale(F("[STATIONS] File /stations.json assente o non valido. Inizializzazione stazioni predefinite...\n"));
+    // --- FALLBACK PRIMO AVVIO (FLASH VERGINE) ---
+    logSuSeriale(F("[STATIONS] File /stations.json non trovato. Inizializzazione stazioni predefinite...\n"));
 
     stations.clear();
     stations.push_back({"Radio Deejay", "http://streamcdnb1-4c4b867c89244861ac216426883d1ad0.msvdn.net/radiodeejay/radiodeejay/play1.m3u8", "en"});
@@ -879,10 +904,7 @@ bool loadStations() {
     stations.push_back({"Subasio", "http://icy.unitedradio.it/Subasio.mp3", "it"});
     stations.push_back({"M2O", "http://streamcdnf26-4c4b867c89244861ac216426883d1ad0.msvdn.net/radiom2o/radiom2o/play1.m3u8", "it"});
 
-    // Chiudiamo il FS prima di chiamare saveStationsToFS (che gestirà la sua apertura in scrittura)
-    LittleFS.end();
-
-    // Salva le stazioni di default su memoria flash per i successivi riavvii
+    // Salva subito il file su LittleFS per i successivi avvii
     return saveStationsToFS();
 }
 
@@ -932,12 +954,18 @@ String jsonEscape(const String& s) {
 // Gestori WebServer dedicati alla modifica delle stazioni
 // ─────────────────────────────────────────────────────────────────────────────
 void handleManageStations() {
-    String stationsJson = "[";
-    for (size_t i = 0; i < stations.size(); i++) {
-        stationsJson += "{\"name\":\"" + jsonEscape(stations[i].name) + "\",\"url\":\"" + jsonEscape(stations[i].url) + "\",\"lang\":\"" + jsonEscape(stations[i].nameLang) + "\"}";
-        if (i < stations.size() - 1) stationsJson += ",";
+    String stationsJson;
+    {
+        JsonDocument doc;
+        JsonArray arr = doc.to<JsonArray>();
+        for (const auto& s : stations) {
+            JsonObject obj = arr.add<JsonObject>();
+            obj["name"] = s.name;
+            obj["url"]  = s.url;
+            obj["lang"] = s.nameLang;
+        }
+        serializeJson(doc, stationsJson);
     }
-    stationsJson += "]";
 
     server.setContentLength(CONTENT_LENGTH_UNKNOWN);
     server.send(200, "text/html", "");
@@ -987,11 +1015,12 @@ void handleManageStations() {
         <div class='eq-group'>
             <label for='eq-preset'>Profilo Audio</label>
             <select id='eq-preset' style='width: 100%; padding: 12px; border-radius: 8px; border: 1px solid #cbd5e1; font-size: 1rem; background-color: #f8fafc;' onchange='applyPreset(this.value)'>
-                <option value='0,0,0'>Flat / Neutro</option>
-                <option value='5,-4,4'>Pure Evoke (Originale)</option>
-                <option value='3,1,-1'>Warm Vintage</option>
-                <option value='4,-1,3.5'>Rock Overdrive</option>
-                <option value='-3,4,-2'>Parlato / News</option>
+                <option value='0,0,0,1,1,1'>Flat / Neutro</option>
+                <option value='5,-4,4,1,1,1.1'>Pure Evoke (Originale)</option>
+                <option value='5,-4,4,1.2,0.4,1.1'>Pure Evoke Valvolare</option>
+                <option value='3,1,-1,1.25,0.3,1.1'>Warm Vintage</option>
+                <option value='4,-1,3.5,1.35,0.45,1'>Rock Overdrive</option>
+                <option value='-3,4,-2,1,1,1'>Parlato / News</option>
             </select>
         </div>
     </div>
@@ -1040,6 +1069,7 @@ void handleManageStations() {
 
     server.sendContent("\n<script>\nlet stations = " + stationsJson + ";\n");
     server.sendContent("let currentEq = { low: " + String(eqLow, 2) + ", mid: " + String(eqMid, 2) + ", high: " + String(eqHigh, 2) + " };\n");
+    server.sendContent("let tubeParams = { drive: " + String(tubeParams.drive, 2) + ", cutoff: " + String(tubeParams.cutoffAlpha, 2) + ", gain: " + String(tubeParams.makeUpGain, 2) + " };\n");
 
     server.sendContent(R"raw(
     function initEq() {
@@ -1049,7 +1079,10 @@ void handleManageStations() {
         const currentVec = [
             parseFloat(currentEq.low),
             parseFloat(currentEq.mid),
-            parseFloat(currentEq.high)
+            parseFloat(currentEq.high),
+            parseFloat(tubeParams.drive),
+            parseFloat(tubeParams.cutoff),
+            parseFloat(tubeParams.gain)
         ];
 
         let found = false;
@@ -1057,7 +1090,7 @@ void handleManageStations() {
             const optParts = select.options[i].value.split(',').map(v => parseFloat(v));
             
             let match = true;
-            for(let j = 0; j < 3; j++) {
+            for(let j = 0; j < 6; j++) {
                 if (Math.abs(optParts[j] - currentVec[j]) > 0.01) {
                     match = false;
                     break;
@@ -1073,7 +1106,7 @@ void handleManageStations() {
 
         if (!found) {
             let opt = document.createElement('option');
-            opt.value = `${currentEq.low},${currentEq.mid},${currentEq.high}`;
+            opt.value = `${currentEq.low},${currentEq.mid},${currentEq.high},${tubeParams.drive},${tubeParams.cutoff},${tubeParams.gain}`;
             opt.innerText = `Personalizzato (${currentEq.low}, ${currentEq.mid}, ${currentEq.high})`;
             opt.selected = true;
             select.appendChild(opt);
@@ -1087,11 +1120,14 @@ void handleManageStations() {
         const l = parts[0];
         const m = parts[1];
         const h = parts[2];
+        const drive = parts[3] !== undefined ? parts[3] : 1.0;
+        const cutoff = parts[4] !== undefined ? parts[4] : 1.0;
+        const gain = parts[5] !== undefined ? parts[5] : 1.0;
 
         fetch('/seteq', {
             method: 'POST',
             headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-            body: `low=${l}&mid=${m}&high=${h}`
+            body: `low=${l}&mid=${m}&high=${h}&drive=${drive}&cutoff=${cutoff}&gain=${gain}`
         }).then(res => {
             if (!res.ok) alert('Errore nell\'applicazione del preset!');
         });
@@ -1133,11 +1169,20 @@ void handleManageStations() {
             editBtn.className = 'btn btn-orange';
             editBtn.textContent = 'Modifica';
             editBtn.onclick = () => startEdit(index);
-            const delBtn = document.createElement('a');
+            const delBtn = document.createElement('button');
             delBtn.className = 'btn btn-red';
-            delBtn.href = '/delete?id=' + index;
             delBtn.textContent = 'Elimina';
-            delBtn.onclick = () => confirm('Eliminare "' + station.name + '"?');
+            delBtn.onclick = () => {
+                if (!confirm('Eliminare "' + station.name + '"?')) return;
+                fetch('/delete', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+                    body: 'id=' + index
+                }).then(res => {
+                    if (res.ok) location.reload();
+                    else alert('Errore durante l\'eliminazione!');
+                });
+            };
             actions.appendChild(editBtn);
             actions.appendChild(delBtn);
 
@@ -1228,11 +1273,15 @@ void handleSetEq() {
         eqMid  = server.arg("mid").toFloat();
         eqHigh = server.arg("high").toFloat();
 
+        if (server.hasArg("drive")) tubeParams.drive = server.arg("drive").toFloat();
+        if (server.hasArg("cutoff")) tubeParams.cutoffAlpha = server.arg("cutoff").toFloat();
+        if (server.hasArg("gain")) tubeParams.makeUpGain = server.arg("gain").toFloat();
+
         audio.setTone(eqLow, eqMid, eqHigh);
         saveState();
 
-        logSuSeriale(F("[EQ] Nuovo EQ applicato: Low=%.1f, Mid=%.1f, High=%.1f\n"), 
-                     eqLow, eqMid, eqHigh);
+        logSuSeriale(F("[EQ] Nuovo EQ applicato: Low=%.1f, Mid=%.1f, High=%.1f, Tube=(%.2f,%.2f,%.2f)\n"), 
+                     eqLow, eqMid, eqHigh, tubeParams.drive, tubeParams.cutoffAlpha, tubeParams.makeUpGain);
         server.send(200, "text/plain", "OK");
     } else {
         server.send(400, "text/plain", "Bad Request");
@@ -1252,4 +1301,40 @@ void logSuSeriale(const __FlashStringHelper *frmt, ...) {
     Serial.print(msg_buf);
     va_end(args);
 #endif
+}
+
+// Processing Audio RAW (Valvolare)
+void audio_process_raw_samples(int32_t* outBuff, int16_t validSamples) {
+    if (tubeParams.drive <= 1.0f) return;
+
+    const int totalSamples = validSamples * 2; 
+
+    for (int i = 0; i < totalSamples; i++) {
+        float x = (float)outBuff[i] / 2147483647.0f;
+        
+        x = x * tubeParams.drive;
+
+        if (x > 1.0f) {
+            x = 1.0f;
+        } else if (x < -1.0f) {
+            x = -1.0f;
+        } else {
+            x = x - (x * x * x) * 0.3333f;
+        }
+
+        x = x * tubeParams.makeUpGain;
+
+        if (i % 2 == 0) {
+            x = lastSampleL + tubeParams.cutoffAlpha * (x - lastSampleL);
+            lastSampleL = x;
+        } else {
+            x = lastSampleR + tubeParams.cutoffAlpha * (x - lastSampleR);
+            lastSampleR = x;
+        }
+
+        if (x > 0.999f)  x = 0.999f;
+        if (x < -0.999f) x = -0.999f;
+
+        outBuff[i] = (int32_t)(x * 2147483647.0f);
+    }
 }
