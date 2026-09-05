@@ -1,3 +1,4 @@
+//Utilizzare la versione 3.4.7 di Esp32-audioI2S
 #include <WiFi.h>
 #include <WebServer.h>
 #include <Audio.h>
@@ -21,7 +22,7 @@ struct Station {
 std::vector<Station> stations;
 
 // ── Debug ─────────────────────────────────────────────────────────────────────
-#define DEBUGGAME
+//#define DEBUGGAME
 
 // ── Pin I2S ───────────────────────────────────────────────────────────────────
 #define I2S_DOUT   12
@@ -160,6 +161,13 @@ int           presetBlinkTarget  = 0;
 bool          presetBlinkPhase   = false;  // true=acceso, false=spento
 bool          presetBlinkActive  = false;
 const unsigned long PRESET_BLINK_MS = 150;
+
+// ── DIAG: log periodico RSSI/buffer per debug audio a scatti ──────────────────
+unsigned long lastDiagLogTime      = 0;
+const unsigned long DIAG_LOG_INTERVAL_MS = 2000;
+uint32_t      diagLoopCounter      = 0;   // giri di loop() nell'ultima finestra
+unsigned long diagLoopWindowStart  = 0;
+uint32_t      diagLastLoopHz       = 0;   // giri di loop() al secondo, sull'ultima finestra
 
 // ── Prototipi ─────────────────────────────────────────────────────────────────
 void logSuSeriale(const __FlashStringHelper *frmt, ...);
@@ -618,10 +626,12 @@ void loop() {
 
         case STATE_INIT:
         if (loadWifiConfig()) {
+            /*
             IPAddress local_IP(192, 168, 1, 201);
             IPAddress gateway(192, 168, 1, 1);
             IPAddress subnet(255, 255, 255, 0);
-            IPAddress primaryDNS(192, 168, 1, 1);  
+            IPAddress primaryDNS(192, 168, 1, 1);
+            */
             setLed(LED_YELLOW);
             WiFi.disconnect(true, true);
             delay(100);
@@ -629,7 +639,9 @@ void loop() {
             delay(100);
             WiFi.mode(WIFI_STA);
             delay(100);
-            WiFi.config(local_IP, gateway, subnet, primaryDNS);
+            //WiFi.config(local_IP, gateway, subnet, primaryDNS);
+            //WiFi.setScanMethod(WIFI_ALL_CHANNEL_SCAN);
+            //WiFi.setSortMethod(WIFI_CONNECT_AP_BY_SIGNAL);
             WiFi.begin(wifiSsid.c_str(), wifiPass.c_str());
             connectionStartTime = millis();
             currentState = STATE_WAITWIFICONNECTION;
@@ -657,17 +669,19 @@ void loop() {
                     delay(500);
                 }
             } else {
+                logSuSeriale(F("[WIFI] Connesso a BSSID=%s canale=%d rssi=%d dBm\n"),
+                             WiFi.BSSIDstr().c_str(), WiFi.channel(), WiFi.RSSI());
                 if (rtcWifiPowerIdx != uiRetry) {
                     WiFi.setSleep(WIFI_PS_NONE); 
                     rtcWifiPowerIdx = uiRetry;
                     saveState();
                 }
-                /*if (MDNS.begin("ESPRetroRadio")) {
+                if (MDNS.begin("ESPRetroRadio")) {
                     logSuSeriale(F("[MDNS] Avviato: ESPRetroRadio.local\n"));
                     MDNS.addService("http", "tcp", 80);
                 } else {
                     logSuSeriale(F("[MDNS] Avvio fallito\n"));
-                }*/
+                }
                 setLed(LED_CYAN);
                 isSpeakingStation = true;
                 ttsStartTime = millis();
@@ -715,11 +729,32 @@ void loop() {
 
         case STATE_PLAYER:
         {
+            diagLoopCounter++;
+
             audio.loop();
             encoderVolume.tick();
             encoderStazioni.tick();
             btnVolume.tick();
             btnStazioni.tick();
+
+            // ── DIAG: RSSI + stato buffer audio + velocità loop() ──────────────
+            if (millis() - lastDiagLogTime >= DIAG_LOG_INTERVAL_MS) {
+                unsigned long windowMs = millis() - diagLoopWindowStart;
+                diagLastLoopHz = (windowMs > 0) ? (diagLoopCounter * 1000UL / windowMs) : 0;
+
+                logSuSeriale(F("[DIAG] rssi=%d dBm buf_filled=%u buf_free=%u bitrate=%u loopHz=%u speaking=%d pendingPlay=%d\n"),
+                             WiFi.RSSI(),
+                             (unsigned)audio.inBufferFilled(),
+                             (unsigned)audio.inBufferFree(),
+                             (unsigned)audio.getBitRate(),
+                             (unsigned)diagLastLoopHz,
+                             (int)isSpeakingStation,
+                             (int)hasPendingPlay);
+
+                lastDiagLogTime     = millis();
+                diagLoopCounter      = 0;
+                diagLoopWindowStart  = millis();
+            }
 
             if (vuMeterAttivo && !isSpeakingStation && !presetBlinkActive) { 
                 //aggiornaLedVuMeter(audio.getVUlevel());
