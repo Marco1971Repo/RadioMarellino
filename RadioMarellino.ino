@@ -1,4 +1,3 @@
-//Utilizzare la versione 3.4.7 di Esp32-audioI2S
 #include <WiFi.h>
 #include <WebServer.h>
 #include <Audio.h>
@@ -185,7 +184,6 @@ void handleSave();
 void handleManageStations();
 void handleAddStation();
 void handleDeleteStation();
-void handleSetEq();
 void markSkipSleepOnBoot();
 bool consumeSkipSleepFlag();
 void enterApModeFromButton();
@@ -559,7 +557,6 @@ void setup() {
             server.on("/",       HTTP_GET,  handleManageStations);
             server.on("/add",    HTTP_POST, handleAddStation);
             server.on("/delete", HTTP_GET,  handleDeleteStation);
-            server.on("/seteq",  HTTP_POST, handleSetEq);
             server.on("/save",   HTTP_POST, handleSave);
             server.begin();
 
@@ -957,6 +954,7 @@ String jsonEscape(const String& s) {
             case '`':  out += "\\`";  break;
             case '\n': out += "\\n";  break;
             case '\r': break;
+            case '<': out += "\\u003c"; break;
             default:   out += c;
         }
     }
@@ -992,8 +990,6 @@ void handleManageStations() {
         .card { background: #ffffff; border-radius: 12px; padding: 16px; box-shadow: 0 4px 12px rgba(0,0,0,0.05); border: 1px solid #e2e8f0; }
         label { display: block; font-size: 0.85rem; font-weight: 600; color: #64748b; margin-bottom: 4px; text-transform: uppercase; }
         input[type="text"], input[type="password"] { width: 100%; padding: 12px; margin-bottom: 14px; border: 1px solid #cbd5e1; border-radius: 8px; font-size: 1rem; background-color: #f8fafc; -webkit-appearance: none; }
-        
-        .eq-group { margin-bottom: 14px; }
 
         button, .btn { display: inline-flex; align-items: center; justify-content: center; width: 100%; padding: 14px; border: none; border-radius: 8px; font-size: 1rem; font-weight: 600; cursor: pointer; text-decoration: none; }
         button:active, .btn:active { transform: scale(0.98); }
@@ -1017,20 +1013,6 @@ void handleManageStations() {
 <div class='phone-wrapper'>
     <h2>📻 Gestione Web Radio</h2>
     
-    <div class='card'>
-        <h3>🎛️ Equalizzatore (Preset Tono)</h3>
-        <div class='eq-group'>
-            <label for='eq-preset'>Profilo Audio</label>
-            <select id='eq-preset' style='width: 100%; padding: 12px; border-radius: 8px; border: 1px solid #cbd5e1; font-size: 1rem; background-color: #f8fafc;' onchange='applyPreset(this.value)'>
-                <option value='0,0,0'>Flat / Neutro</option>
-                <option value='5,-4,4'>Pure Evoke (Originale)</option>
-                <option value='3,1,-1'>Warm Vintage</option>
-                <option value='4,-1,3.5'>Rock Overdrive</option>
-                <option value='-3,4,-2'>Parlato / News</option>
-            </select>
-        </div>
-    </div>
-
     <div class='card'>
         <h3>⚙️ Cambia Rete WiFi (Opzionale)</h3>
         <form action='/save' method='POST'>
@@ -1074,64 +1056,8 @@ void handleManageStations() {
 )raw");
 
     server.sendContent("\n<script>\nlet stations = " + stationsJson + ";\n");
-    server.sendContent("let currentEq = { low: " + String(eqLow, 2) + ", mid: " + String(eqMid, 2) + ", high: " + String(eqHigh, 2) + " };\n");
 
     server.sendContent(R"raw(
-    function initEq() {
-        const select = document.getElementById('eq-preset');
-        
-        // Confronto basato sulla convergenza dei float
-        const currentVec = [
-            parseFloat(currentEq.low),
-            parseFloat(currentEq.mid),
-            parseFloat(currentEq.high)
-        ];
-
-        let found = false;
-        for (let i = 0; i < select.options.length; i++) {
-            const optParts = select.options[i].value.split(',').map(v => parseFloat(v));
-            
-            let match = true;
-            for(let j = 0; j < 3; j++) {
-                if (Math.abs(optParts[j] - currentVec[j]) > 0.01) {
-                    match = false;
-                    break;
-                }
-            }
-
-            if (match) {
-                select.selectedIndex = i;
-                found = true;
-                break;
-            }
-        }
-
-        if (!found) {
-            let opt = document.createElement('option');
-            opt.value = `${currentEq.low},${currentEq.mid},${currentEq.high}`;
-            opt.innerText = `Personalizzato (${currentEq.low}, ${currentEq.mid}, ${currentEq.high})`;
-            opt.selected = true;
-            select.appendChild(opt);
-        }
-    }
-
-    function applyPreset(valStr) {
-        const parts = valStr.split(',');
-        if (parts.length < 3) return;
-
-        const l = parts[0];
-        const m = parts[1];
-        const h = parts[2];
-
-        fetch('/seteq', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-            body: `low=${l}&mid=${m}&high=${h}`
-        }).then(res => {
-            if (!res.ok) alert('Errore nell\'applicazione del preset!');
-        });
-    }
-
     function renderStations() {
         const listDiv = document.getElementById('stations-list');
         listDiv.innerHTML = '';
@@ -1208,7 +1134,6 @@ void handleManageStations() {
         document.getElementById('cancel-btn').style.display = "none";
     }
 
-    initEq();
     renderStations();
 </script>
 </body>
@@ -1252,23 +1177,6 @@ void handleDeleteStation() {
         }
         server.sendHeader("Location", "/");
         server.send(303, "text/plain", "Redirecting...");
-    } else {
-        server.send(400, "text/plain", "Bad Request");
-    }
-}
-
-void handleSetEq() {
-    if (server.hasArg("low") && server.hasArg("mid") && server.hasArg("high")) {
-        eqLow  = server.arg("low").toFloat();
-        eqMid  = server.arg("mid").toFloat();
-        eqHigh = server.arg("high").toFloat();
-
-        audio.setTone(eqLow, eqMid, eqHigh);
-        saveState();
-
-        logSuSeriale(F("[EQ] Nuovo EQ applicato: Low=%.1f, Mid=%.1f, High=%.1f\n"), 
-                     eqLow, eqMid, eqHigh);
-        server.send(200, "text/plain", "OK");
     } else {
         server.send(400, "text/plain", "Bad Request");
     }
