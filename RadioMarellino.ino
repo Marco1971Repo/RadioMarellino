@@ -9,6 +9,7 @@
 #include <vector>
 #include "esp_sleep.h"
 #include <ESPmDNS.h>
+#include <ArduinoOTA.h>
 
 // ── Struttura stazione ────────────────────────────────────────────────────────
 struct Station {
@@ -28,7 +29,7 @@ std::vector<Station> stations;
 #define I2S_BCLK   13
 #define I2S_LRC    14
 
-// ── Pin Encoder Volume (KY-040) ───────────────────────────────────────────────
+// ── Pin Encoder Volume (KY-040) ───────────────────────────────────────────────LED_YELLOW
 #define PIN_DT   42
 #define PIN_CLK  41
 #define PIN_SW   9   // Pulsante encoder volume → deep sleep
@@ -45,16 +46,17 @@ Adafruit_NeoPixel rgb(NUM_LEDS, PIN_LED_RGB, NEO_GRB + NEO_KHZ800);
 
 // Colori LED
 #define LED_OFF    rgb.Color(0,   0,   0)
-#define LED_YELLOW rgb.Color(255, 255,  0)   // attesa WiFi
+#define LED_YELLOW rgb.Color(255, 100,  0)   // attesa WiFi
 #define LED_RED    rgb.Color(255,   0,  0)   // modalità AP
-#define LED_GREEN  rgb.Color(0,   255,  0)   // riproduzione
+#define LED_GREEN  rgb.Color(255,   100,  0)   // riproduzione
 #define LED_CYAN   rgb.Color(0,   255, 255)  // annuncio TTS
+#define LED_MAGENTA rgb.Color(255,   0, 255)  // attesa OTA
 
 // ── Parametri encoder volume ──────────────────────────────────────────────────
 #define ROTARYSTEPS    1
 #define ROTARYMIN      0
 #define ROTARYMAX      64
-#define VOLUME_DEFAULT 16
+#define VOLUME_DEFAULT 24
 
 // ── GPIO wakeup deep sleep ────────────────────────────────────────────────────
 #define SLEEP_WAKEUP_GPIO  GPIO_NUM_9
@@ -102,7 +104,9 @@ enum MachineStates {
     STATE_PLAYER,
     STATE_START_AP,
     STATE_AP_MODE,
-    STATE_STATIONS_CONFIG
+    STATE_STATIONS_CONFIG,
+    STATE_OTA_WAIT,
+    STATE_OTA
 };
 
 MachineStates currentState = STATE_INIT;
@@ -476,9 +480,62 @@ void my_audio_info(Audio::msg_t m) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// ArduinoOTA (flash da PlatformIO via rete)
+// ─────────────────────────────────────────────────────────────────────────────
+void setupOTA() {
+    ArduinoOTA.setHostname("ESPRetroRadio");
+#ifdef OTA_PASSWORD
+    ArduinoOTA.setPassword(OTA_PASSWORD);
+#endif
+
+    ArduinoOTA.onStart([]() {
+        audio.stopSong();
+        setLed(LED_YELLOW);
+        currentState = STATE_OTA;
+        logSuSeriale(F("[OTA] Avvio aggiornamento (%s)\n"),
+                     (ArduinoOTA.getCommand() == U_FLASH) ? "firmware" : "filesystem");
+    });
+
+    ArduinoOTA.onEnd([]() {
+        setLed(LED_GREEN);
+        logSuSeriale(F("[OTA] Completato, riavvio\n"));
+    });
+
+    ArduinoOTA.onProgress([](unsigned int progress, unsigned int total) {
+        static uint8_t lastPct = 255;
+        uint8_t pct = (total > 0) ? (progress * 100 / total) : 0;
+        if (pct != lastPct) {
+            lastPct = pct;
+            logSuSeriale(F("[OTA] Progresso: %u%%\n"), pct);
+        }
+    });
+
+    ArduinoOTA.onError([](ota_error_t error) {
+        setLed(LED_RED);
+        logSuSeriale(F("[OTA] Errore [%u]: "), error);
+        if      (error == OTA_AUTH_ERROR)    logSuSeriale(F("Auth fallita\n"));
+        else if (error == OTA_BEGIN_ERROR)   logSuSeriale(F("Begin fallito\n"));
+        else if (error == OTA_CONNECT_ERROR) logSuSeriale(F("Connessione fallita\n"));
+        else if (error == OTA_RECEIVE_ERROR) logSuSeriale(F("Errore ricezione\n"));
+        else if (error == OTA_END_ERROR)     logSuSeriale(F("Errore end\n"));
+
+        currentState   = STATE_PLAYER;
+        if (!vuMeterAttivo) setLed(LED_GREEN);
+        hasPendingPlay = true;
+        pendingUrl     = stations[currentStationIdx].url;
+    });
+
+    ArduinoOTA.begin();
+    logSuSeriale(F("[OTA] Pronto su ESPRetroRadio.local\n"));
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Setup
 // ─────────────────────────────────────────────────────────────────────────────
 wifi_power_t wifiPWR[11];
+
+unsigned long       otaWaitStartTime    = 0;
+const unsigned long OTA_WAIT_TIMEOUT_MS = 5*60000;  // attesa massima avvio OTA prima di riprendere la riproduzione
 
 void setup() {
     Audio::audio_info_callback = my_audio_info;
@@ -544,6 +601,23 @@ void setup() {
             if (!vuMeterAttivo && !isSpeakingStation) {
                 setLed(LED_GREEN);
             }
+        } else if (currentState == STATE_OTA_WAIT) {
+            currentState   = STATE_PLAYER;
+            if (!vuMeterAttivo) setLed(LED_GREEN);
+            hasPendingPlay = true;
+            pendingUrl     = stations[currentStationIdx].url;
+        }
+    });
+
+    btnStazioni.attachDoubleClick([]() {
+        if (currentState == STATE_PLAYER) {
+            audio.stopSong();
+            isSpeakingStation = false;
+            hasPendingPlay    = false;
+            vuMeterAttivo     = false;
+            otaWaitStartTime  = millis();
+            currentState      = STATE_OTA_WAIT;
+            logSuSeriale(F("[OTA] In attesa di aggiornamento...\n"));
         }
     });
 
@@ -679,6 +753,7 @@ void loop() {
                 } else {
                     logSuSeriale(F("[MDNS] Avvio fallito\n"));
                 }
+                setupOTA();
                 setLed(LED_CYAN);
                 isSpeakingStation = true;
                 ttsStartTime = millis();
@@ -726,15 +801,14 @@ void loop() {
 
         case STATE_PLAYER:
         {
-            diagLoopCounter++;
-
             audio.loop();
             encoderVolume.tick();
             encoderStazioni.tick();
             btnVolume.tick();
             btnStazioni.tick();
-
+#ifdef DEBUGGAME
             // ── DIAG: RSSI + stato buffer audio + velocità loop() ──────────────
+            diagLoopCounter++;
             if (millis() - lastDiagLogTime >= DIAG_LOG_INTERVAL_MS) {
                 unsigned long windowMs = millis() - diagLoopWindowStart;
                 diagLastLoopHz = (windowMs > 0) ? (diagLoopCounter * 1000UL / windowMs) : 0;
@@ -752,7 +826,7 @@ void loop() {
                 diagLoopCounter      = 0;
                 diagLoopWindowStart  = millis();
             }
-
+#endif
             if (vuMeterAttivo && !isSpeakingStation && !presetBlinkActive) { 
                 //aggiornaLedVuMeter(audio.getVUlevel());
             }
@@ -832,6 +906,29 @@ void loop() {
                 blinkState = !blinkState;
                 setLed(blinkState ? LED_CYAN : LED_OFF);
             }  
+            delay(2);
+            break;
+
+        case STATE_OTA_WAIT:
+            btnStazioni.tick();
+            ArduinoOTA.handle();
+            if (millis() - lastBlinkTime >= 300) {
+                lastBlinkTime = millis();
+                blinkState = !blinkState;
+                setLed(blinkState ? LED_MAGENTA : LED_OFF);
+            }
+            if (millis() - otaWaitStartTime >= OTA_WAIT_TIMEOUT_MS) {
+                currentState   = STATE_PLAYER;
+                if (!vuMeterAttivo) setLed(LED_GREEN);
+                hasPendingPlay = true;
+                pendingUrl     = stations[currentStationIdx].url;
+                logSuSeriale(F("[OTA] Timeout attesa, riprendo riproduzione\n"));
+            }
+            delay(2);
+            break;
+
+        case STATE_OTA:
+            ArduinoOTA.handle();
             delay(2);
             break;
 
