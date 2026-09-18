@@ -136,6 +136,10 @@ String wifiPass = "";
 unsigned long connectionStartTime = 0;
 const unsigned long WIFI_TIMEOUT_MS = 5000;
 
+//Simulazione riscaldamento valvole
+bool warmupLedDone = false;                 // NEW
+const unsigned long WARMUP_LED_MS = 2500;   // NEW: durata dissolvenza LED (riscaldamento valvole)
+
 // Indice per i tentativi di potenza WiFi
 int uiRetry = 0;
 
@@ -703,7 +707,7 @@ void loop() {
             IPAddress subnet(255, 255, 255, 0);
             IPAddress primaryDNS(192, 168, 1, 1);
             */
-            setLed(LED_YELLOW);
+            //setLed(LED_YELLOW);
             WiFi.disconnect(true, true);
             delay(100);
             WiFi.setAutoReconnect(false);
@@ -726,6 +730,24 @@ void loop() {
             btnVolume.tick();
             btnStazioni.tick();
             if (currentState == STATE_START_AP) break;
+
+             // ── SIMULAZIONE RISCALDAMENTO VALVOLE (non bloccante) ──
+            if (!warmupLedDone) {
+                unsigned long elapsed = millis() - connectionStartTime;
+                if (elapsed >= WARMUP_LED_MS) {
+                    rgb.setPixelColor(0, rgb.Color(255, 100, 0));
+                    rgb.show();
+                    warmupLedDone = true;
+                } else {
+                    float progresso = (float)elapsed / (float)WARMUP_LED_MS;
+                    float fattoreLuce = progresso * progresso;
+                    uint8_t r = (uint8_t)(255 * fattoreLuce);
+                    uint8_t g = (uint8_t)(100 * fattoreLuce);
+                    rgb.setPixelColor(0, rgb.Color(r, g, 0));
+                    rgb.show();
+                }
+            }
+
             if (WiFi.status() != WL_CONNECTED) {
                 if (millis() - connectionStartTime > WIFI_TIMEOUT_MS) {
                     WiFi.disconnect();
@@ -737,9 +759,9 @@ void loop() {
                         currentState = STATE_START_AP;
                     }
                 } else {
-                    delay(500);
+                 //   delay(500);
                 }
-            } else {
+            } else if (warmupLedDone) {          // NEW: aspetta fine dissolvenza anche se già connesso
                 logSuSeriale(F("[WIFI] Connesso a BSSID=%s canale=%d rssi=%d dBm\n"),
                              WiFi.BSSIDstr().c_str(), WiFi.channel(), WiFi.RSSI());
                 if (rtcWifiPowerIdx != uiRetry) {
@@ -752,7 +774,7 @@ void loop() {
                     MDNS.addService("http", "tcp", 80);
                 } else {
                     logSuSeriale(F("[MDNS] Avvio fallito\n"));
-                }
+                }     
                 setupOTA();
                 setLed(LED_CYAN);
                 isSpeakingStation = true;
