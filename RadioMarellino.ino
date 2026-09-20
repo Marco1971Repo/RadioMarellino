@@ -40,8 +40,9 @@ std::vector<Station> stations;
 #define PIN_ST_SW   10
 
 // ── LED RGB WS2812B ───────────────────────────────────────────────────────────
-#define PIN_LED_RGB  48
-#define NUM_LEDS     1
+#define PIN_LED_RGB  7 //48
+#define NUM_LEDS     8 //1
+
 Adafruit_NeoPixel rgb(NUM_LEDS, PIN_LED_RGB, NEO_GRB + NEO_KHZ800);
 
 // Colori LED
@@ -205,7 +206,10 @@ void aggiornaLedVuMeter(uint8_t livello);
 // LED helper
 // ─────────────────────────────────────────────────────────────────────────────
 void setLed(uint32_t color) {
-    rgb.setPixelColor(0, color);
+    for (int i = 0; i < NUM_LEDS; i++)
+    {
+        rgb.setPixelColor(i, color);
+    }
     rgb.show();
 }
 
@@ -231,8 +235,7 @@ void startPresetBlinkFeedback(int idx) {
     presetBlinkPhase  = true;
     presetBlinkActive = true;
     presetBlinkTimer  = millis();
-    rgb.setPixelColor(0, audioPresets[idx].ledColor);
-    rgb.show();
+    setLed(audioPresets[idx].ledColor);
 }
 
 void tickPresetBlink() {
@@ -249,8 +252,7 @@ void tickPresetBlink() {
             presetBlinkActive = false;
             if (!vuMeterAttivo && !isSpeakingStation) setLed(LED_GREEN);
         } else {
-            rgb.setPixelColor(0, audioPresets[currentPresetIdx].ledColor);
-            rgb.show();
+            setLed(audioPresets[currentPresetIdx].ledColor);
             presetBlinkPhase = true;
         }
     }
@@ -539,7 +541,7 @@ void setupOTA() {
 wifi_power_t wifiPWR[11];
 
 unsigned long       otaWaitStartTime    = 0;
-const unsigned long OTA_WAIT_TIMEOUT_MS = 5*60000;  // attesa massima avvio OTA prima di riprendere la riproduzione
+const unsigned long OTA_WAIT_TIMEOUT_MS = 10*60000;  // attesa massima avvio OTA prima di riprendere la riproduzione
 
 void setup() {
     Audio::audio_info_callback = my_audio_info;
@@ -689,8 +691,7 @@ void aggiornaLedVuMeter(uint8_t livello) {
         r = (uint8_t)map(percentuale * 100, 81, 100, 180, 255);
     }
 
-    rgb.setPixelColor(0, rgb.Color(r, g, b));
-    rgb.show();
+    setLed(rgb.Color(r, g, b));
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -735,16 +736,14 @@ void loop() {
             if (!warmupLedDone) {
                 unsigned long elapsed = millis() - connectionStartTime;
                 if (elapsed >= WARMUP_LED_MS) {
-                    rgb.setPixelColor(0, rgb.Color(255, 100, 0));
-                    rgb.show();
+                    setLed(rgb.Color(255, 100, 0));
                     warmupLedDone = true;
                 } else {
                     float progresso = (float)elapsed / (float)WARMUP_LED_MS;
                     float fattoreLuce = progresso * progresso;
                     uint8_t r = (uint8_t)(255 * fattoreLuce);
                     uint8_t g = (uint8_t)(100 * fattoreLuce);
-                    rgb.setPixelColor(0, rgb.Color(r, g, 0));
-                    rgb.show();
+                    setLed(rgb.Color(r, g, 0));
                 }
             }
 
