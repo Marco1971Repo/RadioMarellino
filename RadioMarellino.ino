@@ -57,6 +57,7 @@ Adafruit_NeoPixel rgb(NUM_LEDS, PIN_LED_RGB, NEO_GRB + NEO_KHZ800);
 #define ROTARYSTEPS    1
 #define ROTARYMIN      0
 #define ROTARYMAX      64
+#define VOLUMESTEPS  ROTARYMAX 
 #define VOLUME_DEFAULT 24
 
 // ── GPIO wakeup deep sleep ────────────────────────────────────────────────────
@@ -66,6 +67,10 @@ Adafruit_NeoPixel rgb(NUM_LEDS, PIN_LED_RGB, NEO_GRB + NEO_KHZ800);
 #define PRESET_LONGPRESS_MS  500
 // ── Soglia pressione molto prolungata pulsante → ingresso modalità AP ────────
 #define AP_LONGPRESS_MS      4000
+
+// ── Range accettato per i valori EQ dei preset (validazione lato firmware) ───
+#define EQ_MIN_DB  -12.0f
+#define EQ_MAX_DB   12.0f
 
 // ── RTC memory: sopravvive al deep sleep ──────────────────────────────────────
 RTC_DATA_ATTR int rtcStationIdx    = 0;
@@ -79,7 +84,7 @@ float eqMid  = 0.0f;
 float eqHigh = 0.0f;
 
 
-// ── Preset audio hardcoded (speculari alla WebUI) ─────────────────────────────
+// ── Preset audio: valori di fabbrica (usati al primo avvio e per il ripristino) ──
 struct AudioPreset {
     const char* name;
     float low;
@@ -88,7 +93,7 @@ struct AudioPreset {
     uint32_t ledColor;  // colore feedback LED
 };
 
-const AudioPreset audioPresets[] = {
+const AudioPreset defaultAudioPresets[] = {
     { "Flat",            0.0f,  0.0f,  0.0f, 0xFFFFFF },  // bianco
     { "Pure Evoke",      5.0f, -4.0f,  4.0f, 0x00BFFF },  // azzurro
     { "Warm Vintage",    3.0f,  1.0f, -1.0f, 0xFFD700 },  // oro
@@ -96,7 +101,11 @@ const AudioPreset audioPresets[] = {
     { "Parlato",        -3.0f,  4.0f, -2.0f, 0x8A2BE2 },  // viola
 };
 
-const int NUM_PRESETS = sizeof(audioPresets) / sizeof(audioPresets[0]);
+const int NUM_PRESETS = sizeof(defaultAudioPresets) / sizeof(defaultAudioPresets[0]);
+
+// Preset attivi a runtime — nomi e colori LED fissi, low/mid/high modificabili
+// dalla WebUI e persistiti su /presets.json (vedi loadPresets/savePresetsToFS)
+AudioPreset audioPresets[NUM_PRESETS];
 
 // ── State machine ─────────────────────────────────────────────────────────────
 enum MachineStates {
@@ -188,7 +197,6 @@ void saveState();
 void scheduleSave();
 void goToDeepSleep();
 void setLed(uint32_t color);
-void handleRoot();
 void handleSave();
 void handleManageStations();
 void handleAddStation();
@@ -196,9 +204,16 @@ void handleDeleteStation();
 void markSkipSleepOnBoot();
 bool consumeSkipSleepFlag();
 void enterApModeFromButton();
+void startMDNS();
+void registerStationRoutes();
 void applyPreset(int idx);
 void startPresetBlinkFeedback(int idx);
 void tickPresetBlink();
+void loadPresets();
+bool savePresetsToFS();
+void handleSavePresets();
+void handleResetPresets();
+float clampEq(float v);
 String jsonEscape(const String& s);
 void aggiornaLedVuMeter(uint8_t livello);
 
@@ -330,6 +345,87 @@ void scheduleSave() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Persistenza preset EQ su LittleFS
+// ─────────────────────────────────────────────────────────────────────────────
+float clampEq(float v) {
+    if (v < EQ_MIN_DB) return EQ_MIN_DB;
+    if (v > EQ_MAX_DB) return EQ_MAX_DB;
+    return v;
+}
+
+void loadPresets() {
+    // Nomi e colori LED restano sempre quelli di fabbrica; partiamo da lì
+    for (int i = 0; i < NUM_PRESETS; i++) {
+        audioPresets[i] = defaultAudioPresets[i];
+    }
+
+    if (!LittleFS.begin(true)) {
+        logSuSeriale(F("[PRESETS] LittleFS mount fallito in lettura\n"));
+        return;
+    }
+
+    File f = LittleFS.open("/presets.json", "r");
+    if (!f) {
+        logSuSeriale(F("[PRESETS] presets.json non trovato, uso valori di fabbrica\n"));
+        LittleFS.end();
+        savePresetsToFS();  // crea il file per i prossimi avvii
+        return;
+    }
+
+    JsonDocument doc;
+    DeserializationError err = deserializeJson(doc, f);
+    f.close();
+    LittleFS.end();
+
+    if (err) {
+        logSuSeriale(F("[PRESETS] Errore parsing presets.json, uso valori di fabbrica\n"));
+        return;
+    }
+
+    JsonArray arr = doc["presets"].as<JsonArray>();
+    if (arr.isNull() || (int)arr.size() != NUM_PRESETS) {
+        logSuSeriale(F("[PRESETS] presets.json non valido, uso valori di fabbrica\n"));
+        return;
+    }
+
+    int i = 0;
+    for (JsonObject p : arr) {
+        audioPresets[i].low  = clampEq(p["low"]  | defaultAudioPresets[i].low);
+        audioPresets[i].mid  = clampEq(p["mid"]  | defaultAudioPresets[i].mid);
+        audioPresets[i].high = clampEq(p["high"] | defaultAudioPresets[i].high);
+        i++;
+    }
+
+    logSuSeriale(F("[PRESETS] Caricati %d preset da LittleFS\n"), NUM_PRESETS);
+}
+
+bool savePresetsToFS() {
+    if (!LittleFS.begin(true)) return false;
+    File f = LittleFS.open("/presets.json", "w");
+    if (!f) { LittleFS.end(); return false; }
+
+    JsonDocument doc;
+    JsonArray arr = doc["presets"].to<JsonArray>();
+    for (int i = 0; i < NUM_PRESETS; i++) {
+        JsonObject obj = arr.add<JsonObject>();
+        obj["low"]  = audioPresets[i].low;
+        obj["mid"]  = audioPresets[i].mid;
+        obj["high"] = audioPresets[i].high;
+    }
+
+    if (serializeJson(doc, f) == 0) {
+        f.close();
+        LittleFS.end();
+        return false;
+    }
+
+    f.close();
+    LittleFS.end();
+    logSuSeriale(F("[PRESETS] Salvati %d preset su LittleFS\n"), NUM_PRESETS);
+    return true;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // WA: marker su flash per distinguere un ESP.restart()
 // ─────────────────────────────────────────────────────────────────────────────
 void markSkipSleepOnBoot() {
@@ -421,26 +517,6 @@ bool saveWifiConfig(const String& ssid, const String& pass) {
     return true;
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// WebServer Handlers
-// ─────────────────────────────────────────────────────────────────────────────
-void handleRoot() {
-    String html = F(
-        "<!DOCTYPE html><html><head><meta name='viewport' content='width=device-width, initial-scale=1'>"
-        "<style>body{font-family:sans-serif; margin:20px;}"
-        "input[type=text],input[type=password]{width:100%;padding:12px;margin:8px 0;border:1px solid #ccc;box-sizing:border-box;}"
-        "button{background-color:#4CAF50;color:white;padding:14px 20px;margin:8px 0;border:none;width:100%;cursor:pointer;}</style>"
-        "<title>ESP32 Radio Config</title></head><body>"
-        "<h2>Configurazione WiFi</h2>"
-        "<form action='/save' method='POST'>"
-        "<label>SSID</label><input type='text' name='ssid' required>"
-        "<label>Password</label><input type='password' name='password'>"
-        "<button type='submit'>Salva e Riavvia</button>"
-        "</form></body></html>"
-    );
-    server.send(200, "text/html", html);
-}
-
 void handleSave() {
     if (server.hasArg("ssid")) {
         String reqSsid = server.arg("ssid");
@@ -465,6 +541,31 @@ void handleSave() {
     } else {
         server.send(400, "text/plain", "Bad Request");
     }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// mDNS: avvio centralizzato, richiamabile sia da STA che da AP
+// ─────────────────────────────────────────────────────────────────────────────
+void startMDNS() {
+    if (MDNS.begin("ESPRetroRadio")) {
+        MDNS.addService("http", "tcp", 80);
+        logSuSeriale(F("[MDNS] Avviato: ESPRetroRadio.local\n"));
+    } else {
+        logSuSeriale(F("[MDNS] Avvio fallito\n"));
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Registrazione route WebServer per la gestione stazioni (STATE_START_AP / STATE_STATIONS_CONFIG)
+// ─────────────────────────────────────────────────────────────────────────────
+void registerStationRoutes() {
+    server.on("/",       HTTP_GET,  handleManageStations);
+    server.on("/add",    HTTP_POST, handleAddStation);
+    server.on("/delete", HTTP_GET,  handleDeleteStation);
+    server.on("/save",   HTTP_POST, handleSave);
+    server.on("/savepresets",  HTTP_POST, handleSavePresets);
+    server.on("/resetpresets", HTTP_GET,  handleResetPresets);
+    server.begin();
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -566,10 +667,11 @@ void setup() {
     }
 
     loadState();
+    loadPresets();
 
     // Spostata qui l'inizializzazione Hardware dell'Audio
     audio.setPinout(I2S_BCLK, I2S_LRC, I2S_DOUT);
-    audio.setVolumeSteps(64);
+    audio.setVolumeSteps(VOLUMESTEPS);
     audio.setVolume(rtcVolume);
     audio.setTone(eqLow, eqMid, eqHigh);
 
@@ -634,11 +736,7 @@ void setup() {
             hasPendingPlay    = false;
             vuMeterAttivo     = false;
 
-            server.on("/",       HTTP_GET,  handleManageStations);
-            server.on("/add",    HTTP_POST, handleAddStation);
-            server.on("/delete", HTTP_GET,  handleDeleteStation);
-            server.on("/save",   HTTP_POST, handleSave);
-            server.begin();
+            registerStationRoutes();
 
             setLed(LED_CYAN);
             currentState = STATE_STATIONS_CONFIG;
@@ -768,12 +866,7 @@ void loop() {
                     rtcWifiPowerIdx = uiRetry;
                     saveState();
                 }
-                if (MDNS.begin("ESPRetroRadio")) {
-                    logSuSeriale(F("[MDNS] Avviato: ESPRetroRadio.local\n"));
-                    MDNS.addService("http", "tcp", 80);
-                } else {
-                    logSuSeriale(F("[MDNS] Avvio fallito\n"));
-                }     
+                startMDNS();
                 setupOTA();
                 setLed(LED_CYAN);
                 isSpeakingStation = true;
@@ -796,10 +889,9 @@ void loop() {
             WiFi.softAPConfig(local_IP, gateway, subnet);
             WiFi.setTxPower(WIFI_POWER_2dBm);
             WiFi.softAP("ESPRetroRadio_Setup");
+            startMDNS();
 
-            server.on("/",     HTTP_GET,  handleRoot);
-            server.on("/save", HTTP_POST, handleSave);
-            server.begin();
+            registerStationRoutes();
 
             lastBlinkTime = millis();
             uiRetry = 0;
@@ -822,6 +914,10 @@ void loop() {
 
         case STATE_PLAYER:
         {
+            encoderVolume.tick();
+            encoderStazioni.tick();
+            btnVolume.tick();
+            btnStazioni.tick();
             audio.loop();
             encoderVolume.tick();
             encoderStazioni.tick();
@@ -1090,6 +1186,13 @@ void handleManageStations() {
     }
     stationsJson += "]";
 
+    String presetsJson = "[";
+    for (int i = 0; i < NUM_PRESETS; i++) {
+        presetsJson += "{\"name\":\"" + jsonEscape(audioPresets[i].name) + "\",\"low\":" + String(audioPresets[i].low, 1) + ",\"mid\":" + String(audioPresets[i].mid, 1) + ",\"high\":" + String(audioPresets[i].high, 1) + "}";
+        if (i < NUM_PRESETS - 1) presetsJson += ",";
+    }
+    presetsJson += "]";
+
     server.setContentLength(CONTENT_LENGTH_UNKNOWN);
     server.send(200, "text/html", "");
 
@@ -1125,6 +1228,13 @@ void handleManageStations() {
         .station-url { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 140px; }
         .action-buttons { display: flex; gap: 6px; flex-shrink: 0; }
         #empty-label { text-align: center; color: #94a3b8; padding: 20px 0; font-style: italic; }
+        .preset-row { display: flex; align-items: center; gap: 8px; padding: 10px 0; border-bottom: 1px solid #f1f5f9; }
+        .preset-row:last-child { border-bottom: none; }
+        .preset-name { flex: 0 0 96px; font-weight: 600; font-size: 0.85rem; color: #1e293b; }
+        .preset-fields { display: flex; gap: 6px; flex-grow: 1; }
+        .preset-field { display: flex; flex-direction: column; gap: 2px; flex: 1; }
+        .preset-field span { font-size: 0.65rem; font-weight: 600; color: #94a3b8; text-align: center; text-transform: uppercase; }
+        .preset-field input { width: 100%; padding: 8px 4px; border: 1px solid #cbd5e1; border-radius: 6px; font-size: 0.9rem; text-align: center; background-color: #f8fafc; -webkit-appearance: none; }
     </style>
 </head>
 <body>
@@ -1165,6 +1275,15 @@ void handleManageStations() {
         <div id='stations-list'></div>
     </div>
 
+    <div class='card'>
+        <h3>🎛️ Modifica Preset EQ</h3>
+        <form id='presets-form' action='/savepresets' method='POST'>
+            <div id='presets-list'></div>
+            <button type='submit' class='btn btn-blue' style='margin-top: 10px;'>Salva Preset</button>
+        </form>
+        <a href='/resetpresets' class='btn btn-cancel' style='margin-top: 10px; display: block; text-align: center; text-decoration: none;' onclick='return confirm("Ripristinare i valori di fabbrica di tutti i preset?")'>Ripristina Default</a>
+    </div>
+
     <div style='margin-top: 8px;'>
         <form action='/save' method='POST'>
             <button type='submit' class='btn btn-green'>💾 Salva ed Esci (Riavvia)</button>
@@ -1173,7 +1292,7 @@ void handleManageStations() {
 </div>
 )raw");
 
-    server.sendContent("\n<script>\nlet stations = " + stationsJson + ";\n");
+    server.sendContent("\n<script>\nlet stations = " + stationsJson + ";\nlet presets = " + presetsJson + ";\n");
 
     server.sendContent(R"raw(
     function renderStations() {
@@ -1226,6 +1345,43 @@ void handleManageStations() {
         });
     }
 
+    function renderPresets() {
+        const listDiv = document.getElementById('presets-list');
+        listDiv.innerHTML = '';
+        presets.forEach((preset, index) => {
+            const row = document.createElement('div');
+            row.className = 'preset-row';
+
+            const nameEl = document.createElement('span');
+            nameEl.className = 'preset-name';
+            nameEl.textContent = preset.name;
+            row.appendChild(nameEl);
+
+            const fields = document.createElement('div');
+            fields.className = 'preset-fields';
+
+            ['low', 'mid', 'high'].forEach((band) => {
+                const field = document.createElement('div');
+                field.className = 'preset-field';
+                const label = document.createElement('span');
+                label.textContent = band;
+                const input = document.createElement('input');
+                input.type = 'number';
+                input.name = band + index;
+                input.min = '-12';
+                input.max = '12';
+                input.step = '0.5';
+                input.value = preset[band];
+                field.appendChild(label);
+                field.appendChild(input);
+                fields.appendChild(field);
+            });
+
+            row.appendChild(fields);
+            listDiv.appendChild(row);
+        });
+    }
+
     function startEdit(index) {
         const station = stations[index];
         document.getElementById('name').value = station.name;
@@ -1253,6 +1409,7 @@ void handleManageStations() {
     }
 
     renderStations();
+    renderPresets();
 </script>
 </body>
 </html>
@@ -1298,6 +1455,42 @@ void handleDeleteStation() {
     } else {
         server.send(400, "text/plain", "Bad Request");
     }
+}
+
+void handleSavePresets() {
+    for (int i = 0; i < NUM_PRESETS; i++) {
+        String iStr = String(i);
+        if (server.hasArg("low" + iStr))  audioPresets[i].low  = clampEq(server.arg("low"  + iStr).toFloat());
+        if (server.hasArg("mid" + iStr))  audioPresets[i].mid  = clampEq(server.arg("mid"  + iStr).toFloat());
+        if (server.hasArg("high" + iStr)) audioPresets[i].high = clampEq(server.arg("high" + iStr).toFloat());
+    }
+
+    savePresetsToFS();
+
+    // Se il preset appena modificato è quello attivo, applichiamo subito le nuove curve
+    if (currentPresetIdx >= 0 && currentPresetIdx < NUM_PRESETS) {
+        applyPreset(currentPresetIdx);
+    }
+
+    server.sendHeader("Location", "/");
+    server.send(303, "text/plain", "Redirecting...");
+}
+
+void handleResetPresets() {
+    for (int i = 0; i < NUM_PRESETS; i++) {
+        audioPresets[i].low  = defaultAudioPresets[i].low;
+        audioPresets[i].mid  = defaultAudioPresets[i].mid;
+        audioPresets[i].high = defaultAudioPresets[i].high;
+    }
+
+    savePresetsToFS();
+
+    if (currentPresetIdx >= 0 && currentPresetIdx < NUM_PRESETS) {
+        applyPreset(currentPresetIdx);
+    }
+
+    server.sendHeader("Location", "/");
+    server.send(303, "text/plain", "Redirecting...");
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
