@@ -40,8 +40,8 @@ std::vector<Station> stations;
 #define PIN_ST_SW   10
 
 // ── LED RGB WS2812B ───────────────────────────────────────────────────────────
-#define PIN_LED_RGB  7 //48
-#define NUM_LEDS     8 //1
+#define PIN_LED_RGB  48 //7
+#define NUM_LEDS     1 //8
 
 Adafruit_NeoPixel rgb(NUM_LEDS, PIN_LED_RGB, NEO_GRB + NEO_KHZ800);
 
@@ -799,31 +799,57 @@ void loop() {
     switch (currentState) {
 
         case STATE_INIT:
-        if (loadWifiConfig()) {
-            /*
-            IPAddress local_IP(192, 168, 1, 201);
-            IPAddress gateway(192, 168, 1, 1);
-            IPAddress subnet(255, 255, 255, 0);
-            IPAddress primaryDNS(192, 168, 1, 1);
-            */
-            //setLed(LED_YELLOW);
-            WiFi.disconnect(true, true);
-            delay(100);
-            WiFi.setAutoReconnect(false);
-            delay(100);
-            WiFi.mode(WIFI_STA);
-            delay(100);
-            //WiFi.config(local_IP, gateway, subnet, primaryDNS);
-            //WiFi.setScanMethod(WIFI_ALL_CHANNEL_SCAN);
-            //WiFi.setSortMethod(WIFI_CONNECT_AP_BY_SIGNAL);
-            WiFi.begin(wifiSsid.c_str(), wifiPass.c_str());
-            connectionStartTime = millis();
-            currentState = STATE_WAITWIFICONNECTION;
-            WiFi.setTxPower(wifiPWR[uiRetry]);
-        } else {
-            currentState = STATE_START_AP;
-        }
-        break;
+            if (loadWifiConfig()) {
+                WiFi.disconnect(true, true);
+                delay(100);
+                WiFi.setAutoReconnect(false);
+                delay(100);
+                WiFi.mode(WIFI_STA);
+                delay(100);
+
+                // ── SCANSIONE MANUALE RETI PER TROVARE IL RIPETITORE PIÙ VICINO ──
+                logSuSeriale(F("[WIFI] Scansione reti in corso...\n"));
+                int n = WiFi.scanNetworks(false, false, false, 300); // Scansione veloce
+                uint8_t canaleForte = 0;
+                uint8_t macAddressForte[6]; // Conterrà i 6 byte del MAC Address
+                String  macAddressForteStr = ""; // Stringa leggibile per il log su seriale
+                int32_t maxRssi = -100;
+                bool    ripetitoreTrovato = false;
+
+                for (int i = 0; i < n; ++i) {
+                    if (WiFi.SSID(i) == wifiSsid) {
+                        // Trovato un punto di accesso con il nostro nome. È il più forte visto finora?
+                        if (WiFi.RSSI(i) > maxRssi) {
+                            maxRssi = WiFi.RSSI(i);
+                            memcpy(macAddressForte, WiFi.BSSID(i), 6); // Copia l'indirizzo hardware nei 6 byte
+                            macAddressForteStr = WiFi.BSSIDstr(i);      // Salva la stringa (es. "AA:BB:CC:DD:EE:FF")
+                            canaleForte = WiFi.channel(i);
+                            ripetitoreTrovato = true;
+                        }
+                    }
+                }
+                // Puliamo la memoria della scansione
+                WiFi.scanDelete();
+
+                // ── CONNESSIONE MIRATA AL MAC ADDRESS PIÙ FORTE ──
+                if (ripetitoreTrovato) {
+                    logSuSeriale(F("[WIFI] Ottimizzazione segnale: mi collego al MAC [%s] (%d dBm)\n"), 
+                                macAddressForteStr.c_str(), maxRssi);
+                    
+                    // Forziamo l'ESP32 a puntare direttamente a quel MAC Address specifico
+                    WiFi.begin(wifiSsid.c_str(), wifiPass.c_str(), canaleForte, macAddressForte);
+                } else {
+                    logSuSeriale(F("[WIFI] SSID non visto nella scansione, provo connessione standard...\n"));
+                    WiFi.begin(wifiSsid.c_str(), wifiPass.c_str());
+                }
+
+                connectionStartTime = millis();
+                currentState = STATE_WAITWIFICONNECTION;
+                WiFi.setTxPower(wifiPWR[uiRetry]);
+            } else {
+                currentState = STATE_START_AP;
+            }
+            break;
 
         case STATE_WAITWIFICONNECTION:
             btnVolume.tick();
@@ -1480,6 +1506,7 @@ void handleResetPresets() {
     for (int i = 0; i < NUM_PRESETS; i++) {
         audioPresets[i].low  = defaultAudioPresets[i].low;
         audioPresets[i].mid  = defaultAudioPresets[i].mid;
+        
         audioPresets[i].high = defaultAudioPresets[i].high;
     }
 
