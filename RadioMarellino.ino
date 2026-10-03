@@ -23,26 +23,43 @@ std::vector<Station> stations;
 
 // ── Debug ─────────────────────────────────────────────────────────────────────
 //#define DEBUGGAME
+#if defined(ARDUINO_ESP32S3_DEV)
+    // ── Pin I2S ───────────────────────────────────────────────────────────────────
+    #define I2S_DOUT   12
+    #define I2S_BCLK   13
+    #define I2S_LRCLK  14
 
-// ── Pin I2S ───────────────────────────────────────────────────────────────────
-#define I2S_DOUT   12
-#define I2S_BCLK   13
-#define I2S_LRC    14
+    // ── Pin Encoder Volume (KY-040) ───────────────────────────────────────────────LED_YELLOW
+    #define PIN_DT   42
+    #define PIN_CLK  41
+    #define PIN_SW   9   // Pulsante encoder volume → deep sleep
 
-// ── Pin Encoder Volume (KY-040) ───────────────────────────────────────────────LED_YELLOW
-#define PIN_DT   42
-#define PIN_CLK  41
-#define PIN_SW   9   // Pulsante encoder volume → deep sleep
+    // ── Pin Encoder Stazioni ──────────────────────────────────────────────────────
+    #define PIN_ST_DT   4
+    #define PIN_ST_CLK  5
+    #define PIN_ST_SW   10
+    //Pin wakeup deep sleep
+    #define PIN_WAKEUP  9
+    // ── LED RGB WS2812B ───────────────────────────────────────────────────────────
+    #define PIN_LED_RGB  7 //48
+    #define NUM_LEDS     8 //1
+#endif
+#if defined(ARDUINO_YB_ESP32_S3_AMP)
+    // ── Pin Encoder Volume (KY-040) ───────────────────────────────────────────────LED_YELLOW
+    #define PIN_DT   42
+    #define PIN_CLK  41
+    #define PIN_SW   9   // Pulsante encoder volume → deep sleep
 
-// ── Pin Encoder Stazioni ──────────────────────────────────────────────────────
-#define PIN_ST_DT   4
-#define PIN_ST_CLK  5
-#define PIN_ST_SW   10
-
-// ── LED RGB WS2812B ───────────────────────────────────────────────────────────
-#define PIN_LED_RGB  48 //7
-#define NUM_LEDS     1 //8
-
+    // ── Pin Encoder Stazioni ──────────────────────────────────────────────────────
+    #define PIN_ST_DT   4
+    #define PIN_ST_CLK  5
+    #define PIN_ST_SW   10
+    //Pin wakeup deep sleep
+    #define PIN_WAKEUP  9
+    // ── LED RGB WS2812B ───────────────────────────────────────────────────────────
+    #define PIN_LED_RGB  7 //48
+    #define NUM_LEDS     8 //1
+#endif
 Adafruit_NeoPixel rgb(NUM_LEDS, PIN_LED_RGB, NEO_GRB + NEO_KHZ800);
 
 // Colori LED
@@ -59,9 +76,6 @@ Adafruit_NeoPixel rgb(NUM_LEDS, PIN_LED_RGB, NEO_GRB + NEO_KHZ800);
 #define ROTARYMAX      64
 #define VOLUMESTEPS  ROTARYMAX 
 #define VOLUME_DEFAULT 24
-
-// ── GPIO wakeup deep sleep ────────────────────────────────────────────────────
-#define SLEEP_WAKEUP_GPIO  GPIO_NUM_9
 
 // ── Soglia pressione prolungata pulsante → ciclo preset ──────────────────────
 #define PRESET_LONGPRESS_MS  500
@@ -110,6 +124,7 @@ AudioPreset audioPresets[NUM_PRESETS];
 // ── State machine ─────────────────────────────────────────────────────────────
 enum MachineStates {
     STATE_INIT,
+    STATE_WIFI_SCAN,
     STATE_WAITWIFICONNECTION,
     STATE_PLAYER,
     STATE_START_AP,
@@ -148,7 +163,8 @@ const unsigned long WIFI_TIMEOUT_MS = 5000;
 
 //Simulazione riscaldamento valvole
 bool warmupLedDone = false;                 // NEW
-const unsigned long WARMUP_LED_MS = 2500;   // NEW: durata dissolvenza LED (riscaldamento valvole)
+const unsigned long WARMUP_LED_MS = 3500;   // NEW: durata dissolvenza LED (riscaldamento valvole)
+unsigned long warmupStartTime = 0;
 
 // Indice per i tentativi di potenza WiFi
 int uiRetry = 0;
@@ -216,6 +232,7 @@ void handleResetPresets();
 float clampEq(float v);
 String jsonEscape(const String& s);
 void aggiornaLedVuMeter(uint8_t livello);
+void updateWarmupLed();
 
 // ─────────────────────────────────────────────────────────────────────────────
 // LED helper
@@ -472,7 +489,7 @@ void goToDeepSleep() {
     logSuSeriale(F("[SLEEP] Entro in deep sleep.\n"));
     Serial.flush();
 
-    esp_sleep_enable_ext1_wakeup(1ULL << SLEEP_WAKEUP_GPIO, ESP_EXT1_WAKEUP_ANY_LOW);
+    esp_sleep_enable_ext1_wakeup(1ULL << PIN_WAKEUP, ESP_EXT1_WAKEUP_ANY_LOW);
     esp_deep_sleep_start();
 }
 
@@ -662,7 +679,7 @@ void setup() {
     } else {
         logSuSeriale(F("[BOOT] Power-on da corrente, torno in sleep\n"));
         Serial.flush();
-        esp_sleep_enable_ext1_wakeup(1ULL << SLEEP_WAKEUP_GPIO, ESP_EXT1_WAKEUP_ANY_LOW);
+        esp_sleep_enable_ext1_wakeup(1ULL << PIN_WAKEUP, ESP_EXT1_WAKEUP_ANY_LOW);
         esp_deep_sleep_start();
     }
 
@@ -670,7 +687,7 @@ void setup() {
     loadPresets();
 
     // Spostata qui l'inizializzazione Hardware dell'Audio
-    audio.setPinout(I2S_BCLK, I2S_LRC, I2S_DOUT);
+    audio.setPinout(I2S_BCLK, I2S_LRCLK, I2S_DOUT);
     audio.setVolumeSteps(VOLUMESTEPS);
     audio.setVolume(rtcVolume);
     audio.setTone(eqLow, eqMid, eqHigh);
@@ -792,6 +809,21 @@ void aggiornaLedVuMeter(uint8_t livello) {
     setLed(rgb.Color(r, g, b));
 }
 
+void updateWarmupLed() {
+    if (warmupLedDone) return;
+    unsigned long elapsed = millis() - warmupStartTime;
+    if (elapsed >= WARMUP_LED_MS) {
+        setLed(rgb.Color(255, 100, 0));
+        warmupLedDone = true;
+    } else {
+        float progresso = (float)elapsed / (float)WARMUP_LED_MS;
+        float fattoreLuce = progresso * progresso;
+        uint8_t r = (uint8_t)(255 * fattoreLuce);
+        uint8_t g = (uint8_t)(100 * fattoreLuce);
+        setLed(rgb.Color(r, g, 0));
+    }
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Loop
 // ─────────────────────────────────────────────────────────────────────────────
@@ -800,6 +832,8 @@ void loop() {
 
         case STATE_INIT:
             if (loadWifiConfig()) {
+                warmupStartTime = millis();   // NEW: il warmup parte subito, prima dello scan bloccante
+
                 WiFi.disconnect(true, true);
                 delay(100);
                 WiFi.setAutoReconnect(false);
@@ -807,9 +841,27 @@ void loop() {
                 WiFi.mode(WIFI_STA);
                 delay(100);
 
-                // ── SCANSIONE MANUALE RETI PER TROVARE IL RIPETITORE PIÙ VICINO ──
+                // ── SCANSIONE MANUALE RETI PER TROVARE IL RIPETITORE PIÙ VICINO (non bloccante) ──
                 logSuSeriale(F("[WIFI] Scansione reti in corso...\n"));
-                int n = WiFi.scanNetworks(false, false, false, 300); // Scansione veloce
+                WiFi.scanNetworks(true, false, false, 300); // NEW: async=true
+                currentState = STATE_WIFI_SCAN;
+            } else {
+                currentState = STATE_START_AP;
+            }
+            break;
+
+        case STATE_WIFI_SCAN:
+            btnVolume.tick();
+            btnStazioni.tick();
+            if (currentState == STATE_START_AP) break;
+
+            updateWarmupLed(); // NEW: dissolvenza già visibile durante lo scan
+
+            {
+                int16_t scanStatus = WiFi.scanComplete();
+                if (scanStatus == WIFI_SCAN_RUNNING) break; // ancora in corso, si ricontrolla al prossimo giro
+
+                int n = (scanStatus == WIFI_SCAN_FAILED) ? 0 : scanStatus;
                 uint8_t canaleForte = 0;
                 uint8_t macAddressForte[6]; // Conterrà i 6 byte del MAC Address
                 String  macAddressForteStr = ""; // Stringa leggibile per il log su seriale
@@ -846,8 +898,6 @@ void loop() {
                 connectionStartTime = millis();
                 currentState = STATE_WAITWIFICONNECTION;
                 WiFi.setTxPower(wifiPWR[uiRetry]);
-            } else {
-                currentState = STATE_START_AP;
             }
             break;
 
@@ -856,20 +906,7 @@ void loop() {
             btnStazioni.tick();
             if (currentState == STATE_START_AP) break;
 
-             // ── SIMULAZIONE RISCALDAMENTO VALVOLE (non bloccante) ──
-            if (!warmupLedDone) {
-                unsigned long elapsed = millis() - connectionStartTime;
-                if (elapsed >= WARMUP_LED_MS) {
-                    setLed(rgb.Color(255, 100, 0));
-                    warmupLedDone = true;
-                } else {
-                    float progresso = (float)elapsed / (float)WARMUP_LED_MS;
-                    float fattoreLuce = progresso * progresso;
-                    uint8_t r = (uint8_t)(255 * fattoreLuce);
-                    uint8_t g = (uint8_t)(100 * fattoreLuce);
-                    setLed(rgb.Color(r, g, 0));
-                }
-            }
+            updateWarmupLed(); // ── SIMULAZIONE RISCALDAMENTO VALVOLE (non bloccante) ──
 
             if (WiFi.status() != WL_CONNECTED) {
                 if (millis() - connectionStartTime > WIFI_TIMEOUT_MS) {
