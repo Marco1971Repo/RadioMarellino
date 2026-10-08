@@ -41,8 +41,8 @@ std::vector<Station> stations;
     //Pin wakeup deep sleep
     #define PIN_WAKEUP  9
     // ── LED RGB WS2812B ───────────────────────────────────────────────────────────
-    #define PIN_LED_RGB  7 //48
-    #define NUM_LEDS     8 //1
+    #define PIN_LED_RGB  48 //7
+    #define NUM_LEDS     1 //8 
 #endif
 #if defined(ARDUINO_YB_ESP32_S3_AMP)
     // ── Pin Encoder Volume (KY-040) ───────────────────────────────────────────────LED_YELLOW
@@ -1288,6 +1288,11 @@ void handleManageStations() {
         .station-name { font-weight: 600; font-size: 1rem; color: #1e293b; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
         .station-details { font-size: 0.8rem; color: #64748b; display: flex; align-items: center; gap: 6px; }
         .lang-badge { background-color: #e2e8f0; color: #475569; padding: 2px 6px; border-radius: 4px; font-weight: bold; font-size: 0.75rem; text-transform: uppercase; }
+        .badge-warn { background-color: #fef3c7; color: #92400e; }
+        .check { display: flex; align-items: center; gap: 8px; font-size: 0.9rem; color: #475569; margin-bottom: 14px; text-transform: none; font-weight: 400; }
+        .check input { width: 18px; height: 18px; }
+        #rb-status { font-size: 0.85rem; color: #64748b; margin-top: 10px; min-height: 1.2em; }
+        #rb-status.err { color: #b91c1c; }
         .station-url { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 140px; }
         .action-buttons { display: flex; gap: 6px; flex-shrink: 0; }
         #empty-label { text-align: center; color: #94a3b8; padding: 20px 0; font-style: italic; }
@@ -1316,6 +1321,21 @@ void handleManageStations() {
     </div>
 
     <div class='card'>
+        <h3>🔎 Cerca su radio-browser</h3>
+        <form id='rb-form'>
+            <label for='rb-q'>Nome</label>
+            <input type='text' id='rb-q' placeholder='es. virgin rock' autocomplete='off'>
+
+            <label for='rb-cc'>Paese (codice, opzionale)</label>
+            <input type='text' id='rb-cc' placeholder='es. IT' maxlength='2' autocomplete='off'>
+
+            <button type='submit' id='rb-btn' class='btn btn-blue'>Cerca</button>
+        </form>
+        <div id='rb-status'></div>
+        <div id='rb-results'></div>
+    </div>
+
+    <div class='card'>
         <h3 id='form-title'>➕ Nuova Radio</h3>
         <form id='add-form' action='/add' method='POST'>
             <input type='hidden' name='edit_id' id='edit-id' value=''>
@@ -1325,7 +1345,7 @@ void handleManageStations() {
             <label for='url'>URL Stream</label>
             <input type='text' id='url' name='url' required placeholder='es. http://...' autocomplete='off'>
             
-            <label for='lang'>Lingua TTS</label>
+            <label for='lang'>Lingua pronuncia nome stazione</label>
             <input type='text' id='lang' name='lang' value='it' required autocomplete='off'>
             
             <button type='submit' id='submit-btn' class='btn btn-blue'>Aggiungi Stazione</button>
@@ -1358,6 +1378,186 @@ void handleManageStations() {
     server.sendContent("\n<script>\nlet stations = " + stationsJson + ";\nlet presets = " + presetsJson + ";\n");
 
     server.sendContent(R"raw(
+    // ── Ricerca su radio-browser ──────────────────────────────────────────────
+    // Eseguita dal browser del telefono, non dall'ESP32: serve internet sul telefono,
+    // quindi non funziona in modalità AP (ESPRetroRadio_Setup).
+    const RB_FALLBACK = [
+        'https://de1.api.radio-browser.info',
+        'https://de2.api.radio-browser.info',
+        'https://nl1.api.radio-browser.info',
+        'https://at1.api.radio-browser.info'
+    ];
+    const RB_TIMEOUT_MS = 6000;
+    let rbBase = null;
+
+    // Paese → lingua TTS, usata solo se l'API non fornisce languagecode
+    const CC2LANG = { IT:'it', GB:'en', US:'en', IE:'en', AU:'en', CA:'en',
+                      DE:'de', AT:'de', CH:'de', FR:'fr', ES:'es', PT:'pt', NL:'nl' };
+
+    // fetch JSON con timeout (evita attese infinite se non c'è internet)
+    async function rbFetch(url) {
+        const ctrl = new AbortController();
+        const t = setTimeout(() => ctrl.abort(), RB_TIMEOUT_MS);
+        try {
+            const r = await fetch(url, { signal: ctrl.signal });
+            if (!r.ok) throw new Error('HTTP ' + r.status);
+            return await r.json();
+        } finally {
+            clearTimeout(t);
+        }
+    }
+
+    // Sceglie un mirror a caso dalla lista ufficiale; se fallisce usa quelli di riserva
+    async function rbPickServer() {
+        if (rbBase) return rbBase;
+        try {
+            const list = await rbFetch('https://all.api.radio-browser.info/json/servers');
+            // Teniamo solo hostname del dominio radio-browser.info (la lista arriva da rete)
+            const names = list.map(s => s.name).filter(n => /^[a-z0-9.-]+\.radio-browser\.info$/i.test(n || ''));
+            if (names.length) {
+                rbBase = 'https://' + names[Math.floor(Math.random() * names.length)];
+                return rbBase;
+            }
+        } catch (e) {
+            console.warn('Discovery server fallita:', e.message);
+        }
+        rbBase = RB_FALLBACK[0];
+        return rbBase;
+    }
+
+    // Ricerca per nome con failover sui mirror
+    async function rbSearch(name, countryCode) {
+        const p = new URLSearchParams({
+            name: name,
+            limit: '60',          // più del necessario: poi filtriamo lato client
+            hidebroken: 'true',
+            order: 'clickcount',
+            reverse: 'true'
+        });
+        if (countryCode) p.set('countrycode', countryCode.toUpperCase());
+
+        const first = await rbPickServer();
+        const bases = [first, ...RB_FALLBACK.filter(b => b !== first)];
+        let lastErr;
+        for (const base of bases) {
+            try {
+                const res = await rbFetch(base + '/json/stations/search?' + p.toString());
+                rbBase = base;    // ricordiamo il mirror che funziona
+                return res;
+            } catch (e) {
+                console.warn('Mirror ' + base + ' non risponde:', e.message);
+                lastErr = e;
+            }
+        }
+        throw lastErr;
+    }
+
+    // Filtro: stream risolto presente, controllato OK, e (opzionale) solo MP3/AAC non-HLS
+    function rbIsUsable(s, onlyDirect) {
+        if (!s.url_resolved) return false;
+        if (s.lastcheckok !== 1) return false;
+        if (onlyDirect) {
+            if (s.hls === 1) return false;
+            const codec = (s.codec || '').toUpperCase();
+            if (codec !== 'MP3' && codec !== 'AAC' && codec !== 'AAC+') return false;
+        }
+        return true;
+    }
+
+    // Lingua TTS: languagecode dell'API se di 2 lettere, altrimenti dal paese, altrimenti 'it'
+    function rbGuessLang(s) {
+        const lc = (s.languagecode || '').split(',')[0].trim().toLowerCase();
+        if (/^[a-z]{2}$/.test(lc)) return lc;
+        return CC2LANG[(s.countrycode || '').toUpperCase()] || 'it';
+    }
+
+    // Render risultati (solo textContent: i dati arrivano da terzi, mai innerHTML)
+    function rbRenderResults(list) {
+        const box = document.getElementById('rb-results');
+        box.innerHTML = '';
+        if (list.length === 0) {
+            const e = document.createElement('div');
+            e.id = 'empty-label';
+            e.textContent = 'Nessun risultato utilizzabile';
+            box.appendChild(e);
+            return;
+        }
+        list.forEach((s) => {
+            const item = document.createElement('div');
+            item.className = 'station-item';
+
+            const info = document.createElement('div');
+            info.className = 'station-info';
+
+            const nameEl = document.createElement('span');
+            nameEl.className = 'station-name';
+            nameEl.textContent = (s.name || '').trim();
+            nameEl.title = s.url_resolved;
+
+            const details = document.createElement('span');
+            details.className = 'station-details';
+            const addBadge = (txt, warn) => {
+                const b = document.createElement('span');
+                b.className = 'lang-badge' + (warn ? ' badge-warn' : '');
+                b.textContent = txt;
+                details.appendChild(b);
+            };
+            if (s.countrycode) addBadge(s.countrycode);
+            addBadge((s.codec || '?') + (s.bitrate ? ' ' + s.bitrate + 'k' : ''));
+            const https = s.url_resolved.toLowerCase().startsWith('https://');
+            addBadge(https ? 'https' : 'http', https);   // https = più RAM/CPU sull'ESP32
+            if (s.hls === 1) addBadge('HLS', true);
+
+            info.appendChild(nameEl);
+            info.appendChild(details);
+
+            const useBtn = document.createElement('button');
+            useBtn.className = 'btn btn-orange';
+            useBtn.textContent = 'Usa';
+            useBtn.onclick = () => rbUseStation(s);
+
+            item.appendChild(info);
+            item.appendChild(useBtn);
+            box.appendChild(item);
+        });
+    }
+
+    // Precompila il form "Nuova Radio" (poi si conferma con il submit esistente → /add)
+    function rbUseStation(s) {
+        resetForm();   // esce da un'eventuale modifica in corso: è sempre una nuova stazione
+        document.getElementById('name').value = (s.name || '').trim();
+        document.getElementById('url').value  = s.url_resolved;
+        document.getElementById('lang').value = rbGuessLang(s);
+        document.getElementById('add-form').scrollIntoView({ behavior: 'smooth' });
+    }
+
+    function rbSetStatus(msg, isErr) {
+        const el = document.getElementById('rb-status');
+        el.textContent = msg;
+        el.className = isErr ? 'err' : '';
+    }
+
+    document.getElementById('rb-form').addEventListener('submit', async (ev) => {
+        ev.preventDefault();
+        const q  = document.getElementById('rb-q').value.trim();
+        const cc = document.getElementById('rb-cc').value.trim();
+        if (q.length < 2) { rbSetStatus('Scrivi almeno 2 caratteri', true); return; }
+
+        const btn = document.getElementById('rb-btn');
+        btn.disabled = true;
+        rbSetStatus('Ricerca in corso...');
+        try {
+            const raw = await rbSearch(q, cc);
+            const usable = raw.filter(s => rbIsUsable(s, false)).slice(0, 25);
+            rbRenderResults(usable);
+            rbSetStatus(raw.length + ' trovate, ' + usable.length + ' utilizzabili');
+        } catch (e) {
+            rbSetStatus('Ricerca non riuscita: serve internet sul telefono (non disponibile in modalità AP).', true);
+        } finally {
+            btn.disabled = false;
+        }
+    });
+
     function renderStations() {
         const listDiv = document.getElementById('stations-list');
         listDiv.innerHTML = '';
