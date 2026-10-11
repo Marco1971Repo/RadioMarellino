@@ -8,6 +8,7 @@
 #include <Adafruit_NeoPixel.h>
 #include <vector>
 #include "esp_sleep.h"
+#include "esp_system.h"
 #include <ESPmDNS.h>
 #include <ArduinoOTA.h>
 
@@ -41,14 +42,14 @@ std::vector<Station> stations;
     //Pin wakeup deep sleep
     #define PIN_WAKEUP  9
     // ── LED RGB WS2812B ───────────────────────────────────────────────────────────
-    #define PIN_LED_RGB  48 //7
-    #define NUM_LEDS     1 //8 
+    #define PIN_LED_RGB  7 //48
+    #define NUM_LEDS     8 //1 
 #endif
 #if defined(ARDUINO_YB_ESP32_S3_AMP)
     // ── Pin Encoder Volume (KY-040) ───────────────────────────────────────────────LED_YELLOW
     #define PIN_DT   42
     #define PIN_CLK  41
-    #define PIN_SW   9   // Pulsante encoder volume → deep sleep
+    #define PIN_SW   9   // Pulsante encoder volume → deep sleepLED_YELLOW
 
     // ── Pin Encoder Stazioni ──────────────────────────────────────────────────────
     #define PIN_ST_DT   4
@@ -57,18 +58,19 @@ std::vector<Station> stations;
     //Pin wakeup deep sleep
     #define PIN_WAKEUP  9
     // ── LED RGB WS2812B ───────────────────────────────────────────────────────────
-    #define PIN_LED_RGB  7 //48
-    #define NUM_LEDS     8 //1
+    #define PIN_LED_RGB  48 //7 
+    #define NUM_LEDS     1 //8
 #endif
 Adafruit_NeoPixel rgb(NUM_LEDS, PIN_LED_RGB, NEO_GRB + NEO_KHZ800);
 
 // Colori LED
 #define LED_OFF    rgb.Color(0,   0,   0)
-#define LED_YELLOW rgb.Color(255, 100,  0)   // attesa WiFi
+#define LED_YELLOW rgb.Color(255, 75,  0)   // Player/warmup done
 #define LED_RED    rgb.Color(255,   0,  0)   // modalità AP
 #define LED_GREEN  rgb.Color(255,   100,  0)   // riproduzione
-#define LED_CYAN   rgb.Color(0,   255, 255)  // annuncio TTS
+#define LED_TTS   rgb.Color(255,   55, 0)  // annuncio TTS
 #define LED_MAGENTA rgb.Color(255,   0, 255)  // attesa OTA
+#define LED_CYAN rgb.Color(0, 200, 255)  // attesa OTA
 
 // ── Parametri encoder volume ──────────────────────────────────────────────────
 #define ROTARYSTEPS    1
@@ -85,12 +87,6 @@ Adafruit_NeoPixel rgb(NUM_LEDS, PIN_LED_RGB, NEO_GRB + NEO_KHZ800);
 // ── Range accettato per i valori EQ dei preset (validazione lato firmware) ───
 #define EQ_MIN_DB  -12.0f
 #define EQ_MAX_DB   12.0f
-
-// ── RTC memory: sopravvive al deep sleep ──────────────────────────────────────
-RTC_DATA_ATTR int rtcStationIdx    = 0;
-RTC_DATA_ATTR int rtcVolume        = VOLUME_DEFAULT;
-RTC_DATA_ATTR int rtcWifiPowerIdx  = 0;
-RTC_DATA_ATTR int rtcPresetIdx     = 0;
 
 // ── Parametri Equalizzatore ───────────────────────────────────────────────────
 float eqLow  = 0.0f;
@@ -168,6 +164,7 @@ unsigned long warmupStartTime = 0;
 
 // Indice per i tentativi di potenza WiFi
 int uiRetry = 0;
+int savedWifiPowerIdx = 0;   // ultimo valore di uiRetry persistito su state.json
 
 // ── Stato riproduzione ────────────────────────────────────────────────────────
 String pendingUrl        = "";
@@ -185,6 +182,7 @@ bool          blinkState    = false;
 // ── Throttle salvataggio stato su flash ───────────────────────────────────────
 unsigned long lastSaveTime  = 0;
 bool          pendingSave   = false;
+String        lastSavedState;   // ultimo JSON scritto/caricato: evita scritture inutili
 const unsigned long SAVE_DEBOUNCE_MS = 2000;  
 
 // ── Timer e contatore lampeggi feedback preset ────────────────────────────────
@@ -217,8 +215,6 @@ void handleSave();
 void handleManageStations();
 void handleAddStation();
 void handleDeleteStation();
-void markSkipSleepOnBoot();
-bool consumeSkipSleepFlag();
 void enterApModeFromButton();
 void startMDNS();
 void registerStationRoutes();
@@ -293,72 +289,95 @@ void tickPresetBlink() {
 // ─────────────────────────────────────────────────────────────────────────────
 // Persistenza stato su LittleFS
 // ─────────────────────────────────────────────────────────────────────────────
-void loadState() {
-    if (!LittleFS.begin(true)) {
-        logSuSeriale(F("[STATE] LittleFS mount fallito in lettura\n"));
-        return;
-    }
-
-    File f = LittleFS.open("/state.json", "r");
-    if (!f) {
-        logSuSeriale(F("[STATE] state.json non trovato, uso valori default\n"));
-        LittleFS.end();
-        return;
-    }
-
-    JsonDocument doc;
-    if (deserializeJson(doc, f) == DeserializationError::Ok) {
-        rtcStationIdx   = doc["station"] | 0;
-        rtcVolume       = doc["volume"]  | VOLUME_DEFAULT;
-        rtcWifiPowerIdx = doc["wifi_power_idx"] | 0;
-        rtcPresetIdx    = doc["preset_idx"] | 0;
-        eqLow           = doc["eq_low"]  | 0.0f;
-        eqMid           = doc["eq_mid"]  | 0.0f;
-        eqHigh          = doc["eq_high"] | 0.0f;
-        
-        logSuSeriale(F("[STATE] Caricato da flash: stazione=%d, vol=%d, preset=%d, EQ=(%.1f,%.1f,%.1f), wifi_power_idx=%d\n"),
-                     rtcStationIdx, rtcVolume, rtcPresetIdx, eqLow, eqMid, eqHigh, rtcWifiPowerIdx);
-    } else {
-        logSuSeriale(F("[STATE] Errore parsing state.json\n"));
-    }
-
-    f.close();
-    LittleFS.end();
-}
-
-void saveState() {
-    if (!LittleFS.begin(true)) {
-        logSuSeriale(F("[STATE] LittleFS mount fallito in scrittura\n"));
-        return;
-    }
-
-    File f = LittleFS.open("/state.json", "w");
-    if (!f) {
-        logSuSeriale(F("[STATE] Impossibile aprire state.json in scrittura\n"));
-        LittleFS.end();
-        return;
-    }
-
+// JSON dello stato corrente: serve a salvare su flash solo quando qualcosa è cambiato.
+// L'EQ non è più salvato qui: si ricava dal preset (preset_idx) a ogni avvio.
+static String stateToJson() {
     JsonDocument doc;
     doc["station"]        = currentStationIdx;
     doc["volume"]         = lastPos;
     doc["wifi_power_idx"] = uiRetry;
     doc["preset_idx"]     = currentPresetIdx;
-    doc["eq_low"]         = eqLow;
-    doc["eq_mid"]         = eqMid;
-    doc["eq_high"]        = eqHigh;
-    
-    serializeJson(doc, f);
-    f.close();
-    LittleFS.end();
 
-    logSuSeriale(F("[STATE] Salvato su flash: stazione=%d, vol=%d, preset=%d, EQ=(%.1f,%.1f,%.1f), wifi_power_idx=%d\n"),
-                 currentStationIdx, lastPos, currentPresetIdx, eqLow, eqMid, eqHigh, uiRetry);
+    String out;
+    serializeJson(doc, out);
+    return out;
+}
+
+void loadState() {
+    // Valori di default (usati se state.json manca o non è valido)
+    currentStationIdx = 0;
+    lastPos           = VOLUME_DEFAULT;
+    uiRetry           = 0;
+    savedWifiPowerIdx = 0;
+    currentPresetIdx  = 0;
+
+    File f = LittleFS.open("/state.json", "r");
+    if (!f) {
+        logSuSeriale(F("[STATE] state.json non trovato, uso valori default\n"));
+        return;
+    }
+
+    JsonDocument doc;
+    if (deserializeJson(doc, f) == DeserializationError::Ok) {
+        currentStationIdx = doc["station"] | 0;
+        lastPos           = doc["volume"]  | VOLUME_DEFAULT;
+        uiRetry           = doc["wifi_power_idx"] | 0;
+        savedWifiPowerIdx = uiRetry;
+        currentPresetIdx  = doc["preset_idx"] | 0;
+        if (currentPresetIdx < 0 || currentPresetIdx >= NUM_PRESETS) currentPresetIdx = 0;
+
+        lastSavedState = stateToJson();
+
+        logSuSeriale(F("[STATE] Caricato da flash: stazione=%d, vol=%d, preset=%d, wifi_power_idx=%d\n"),
+                     currentStationIdx, lastPos, currentPresetIdx, uiRetry);
+    } else {
+        logSuSeriale(F("[STATE] Errore parsing state.json\n"));
+    }
+
+    f.close();
+}
+
+void saveState() {
+    String json = stateToJson();
+    if (json == lastSavedState) return;   // nulla è cambiato dall'ultimo salvataggio
+
+    File f = LittleFS.open("/state.json", "w");
+    if (!f) {
+        logSuSeriale(F("[STATE] Impossibile aprire state.json in scrittura\n"));
+        return;
+    }
+
+    f.print(json);
+    f.close();
+    lastSavedState = json;
+
+    logSuSeriale(F("[STATE] Salvato su flash: stazione=%d, vol=%d, preset=%d, wifi_power_idx=%d\n"),
+                 currentStationIdx, lastPos, currentPresetIdx, uiRetry);
 }
 
 void scheduleSave() {
     lastSaveTime = millis();
     pendingSave  = true;
+}
+
+// Scrittura "atomica": scrive su <path>.tmp e poi rinomina, così un'interruzione di
+// corrente a metà scrittura non lascia un file troncato.
+static bool writeJsonAtomic(const char* path, const JsonDocument& doc) {
+    String tmp = String(path) + ".tmp";
+    File f = LittleFS.open(tmp.c_str(), "w");
+    if (!f) return false;
+
+    size_t n = serializeJson(doc, f);
+    f.close();
+    if (n == 0) {
+        LittleFS.remove(tmp.c_str());
+        return false;
+    }
+    if (LittleFS.rename(tmp.c_str(), path)) return true;
+
+    // Se il rename sopra un file esistente non è supportato: rimuovi e riprova
+    LittleFS.remove(path);
+    return LittleFS.rename(tmp.c_str(), path);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -376,15 +395,9 @@ void loadPresets() {
         audioPresets[i] = defaultAudioPresets[i];
     }
 
-    if (!LittleFS.begin(true)) {
-        logSuSeriale(F("[PRESETS] LittleFS mount fallito in lettura\n"));
-        return;
-    }
-
     File f = LittleFS.open("/presets.json", "r");
     if (!f) {
         logSuSeriale(F("[PRESETS] presets.json non trovato, uso valori di fabbrica\n"));
-        LittleFS.end();
         savePresetsToFS();  // crea il file per i prossimi avvii
         return;
     }
@@ -392,7 +405,6 @@ void loadPresets() {
     JsonDocument doc;
     DeserializationError err = deserializeJson(doc, f);
     f.close();
-    LittleFS.end();
 
     if (err) {
         logSuSeriale(F("[PRESETS] Errore parsing presets.json, uso valori di fabbrica\n"));
@@ -417,10 +429,6 @@ void loadPresets() {
 }
 
 bool savePresetsToFS() {
-    if (!LittleFS.begin(true)) return false;
-    File f = LittleFS.open("/presets.json", "w");
-    if (!f) { LittleFS.end(); return false; }
-
     JsonDocument doc;
     JsonArray arr = doc["presets"].to<JsonArray>();
     for (int i = 0; i < NUM_PRESETS; i++) {
@@ -430,34 +438,10 @@ bool savePresetsToFS() {
         obj["high"] = audioPresets[i].high;
     }
 
-    if (serializeJson(doc, f) == 0) {
-        f.close();
-        LittleFS.end();
-        return false;
-    }
+    if (!writeJsonAtomic("/presets.json", doc)) return false;
 
-    f.close();
-    LittleFS.end();
     logSuSeriale(F("[PRESETS] Salvati %d preset su LittleFS\n"), NUM_PRESETS);
     return true;
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// WA: marker su flash per distinguere un ESP.restart()
-// ─────────────────────────────────────────────────────────────────────────────
-void markSkipSleepOnBoot() {
-    if (!LittleFS.begin(true)) return;
-    File f = LittleFS.open("/skip_sleep.flag", "w");
-    if (f) f.close();
-    LittleFS.end();
-}
-
-bool consumeSkipSleepFlag() {
-    if (!LittleFS.begin(true)) return false;
-    bool skip = LittleFS.exists("/skip_sleep.flag");
-    if (skip) LittleFS.remove("/skip_sleep.flag");
-    LittleFS.end();
-    return skip;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -471,16 +455,27 @@ void enterApModeFromButton() {
     setLed(LED_OFF);
     currentState = STATE_START_AP;
 }
-
+// ─────────────────────────────────────────────────────────────────────────────
+// Linea dati LED: hold/rilascio durante il deep sleep
+//   hold = true  → forza il pin basso e lo congela (da chiamare prima dello sleep)
+//   hold = false → rilascia il pin (da chiamare all'inizio di setup(), prima di rgb.begin())
+// Evita che il DIN dei WS2812, sempre alimentati, fluttui e li accenda a caso.
+// ─────────────────────────────────────────────────────────────────────────────
+static void ledPinSleepHold(bool hold) {
+    if (hold) {
+        pinMode(PIN_LED_RGB, OUTPUT);
+        digitalWrite(PIN_LED_RGB, LOW);
+        gpio_hold_en((gpio_num_t)PIN_LED_RGB);
+        gpio_deep_sleep_hold_en();
+    } else {
+        gpio_deep_sleep_hold_dis();
+        gpio_hold_dis((gpio_num_t)PIN_LED_RGB);
+    }
+}
 // ─────────────────────────────────────────────────────────────────────────────
 // Deep Sleep
 // ─────────────────────────────────────────────────────────────────────────────
 void goToDeepSleep() {
-    rtcStationIdx = currentStationIdx;
-    rtcVolume     = (lastPos >= ROTARYMIN) ? lastPos : VOLUME_DEFAULT;
-    rtcWifiPowerIdx = uiRetry;
-    rtcPresetIdx  = currentPresetIdx;
-
     saveState();
     audio.stopSong();
     setLed(LED_OFF);
@@ -488,7 +483,7 @@ void goToDeepSleep() {
 
     logSuSeriale(F("[SLEEP] Entro in deep sleep.\n"));
     Serial.flush();
-
+    ledPinSleepHold(true);
     esp_sleep_enable_ext1_wakeup(1ULL << PIN_WAKEUP, ESP_EXT1_WAKEUP_ANY_LOW);
     esp_deep_sleep_start();
 }
@@ -497,14 +492,12 @@ void goToDeepSleep() {
 // Configurazione WiFi (LittleFS)
 // ─────────────────────────────────────────────────────────────────────────────
 bool loadWifiConfig() {
-    if (!LittleFS.begin(true)) return false;
     File f = LittleFS.open("/config.json", "r");
-    if (!f) { LittleFS.end(); return false; }
+    if (!f) return false;
 
     JsonDocument doc;
     DeserializationError err = deserializeJson(doc, f);
     f.close();
-    LittleFS.end();
 
     if (err) return false;
 
@@ -515,9 +508,8 @@ bool loadWifiConfig() {
 }
 
 bool saveWifiConfig(const String& ssid, const String& pass) {
-    if (!LittleFS.begin(true)) return false;
     File f = LittleFS.open("/config.json", "w");
-    if (!f) { LittleFS.end(); return false; }
+    if (!f) return false;
 
     JsonDocument doc;
     doc["wifi_ssid"] = ssid;
@@ -525,12 +517,10 @@ bool saveWifiConfig(const String& ssid, const String& pass) {
 
     if (serializeJson(doc, f) == 0) {
         f.close();
-        LittleFS.end();
         return false;
     }
 
     f.close();
-    LittleFS.end();
     return true;
 }
 
@@ -548,12 +538,10 @@ void handleSave() {
         delay(1000);
 
         saveWifiConfig(reqSsid, reqPass);
-        markSkipSleepOnBoot();
         ESP.restart();
     } else if (currentState == STATE_STATIONS_CONFIG) {
         server.send(200, "text/html", F("<!DOCTYPE html><html><body><h3>Configurazione completata. Riavvio in corso...</h3></body></html>"));
         delay(1000);
-        markSkipSleepOnBoot();
         ESP.restart();
     } else {
         server.send(400, "text/plain", "Bad Request");
@@ -666,7 +654,7 @@ void setup() {
 #ifdef DEBUGGAME
     Serial.begin(115200);
 #endif
-
+    ledPinSleepHold(false);   // rilascia l'hold prima di toccare i LED
     rgb.begin();
     rgb.setBrightness(255);
     setLed(LED_OFF);
@@ -674,13 +662,19 @@ void setup() {
     esp_sleep_wakeup_cause_t cause = esp_sleep_get_wakeup_cause();
     if (cause == ESP_SLEEP_WAKEUP_EXT1) {
         logSuSeriale(F("[BOOT] Wakeup da pulsante, avvio normale\n"));
-    } else if (consumeSkipSleepFlag()) {
-        logSuSeriale(F("[BOOT] Restart dopo config WiFi, avvio normale\n"));
+    } else if (esp_reset_reason() == ESP_RST_SW) {
+        logSuSeriale(F("[BOOT] Restart software (ESP.restart), avvio normale\n"));
     } else {
         logSuSeriale(F("[BOOT] Power-on da corrente, torno in sleep\n"));
         Serial.flush();
+        ledPinSleepHold(true);
         esp_sleep_enable_ext1_wakeup(1ULL << PIN_WAKEUP, ESP_EXT1_WAKEUP_ANY_LOW);
         esp_deep_sleep_start();
+    }
+
+    // LittleFS viene montato una sola volta e resta montato
+    if (!LittleFS.begin(true)) {
+        logSuSeriale(F("[FS] Mount LittleFS fallito\n"));
     }
 
     loadState();
@@ -689,13 +683,10 @@ void setup() {
     // Spostata qui l'inizializzazione Hardware dell'Audio
     audio.setPinout(I2S_BCLK, I2S_LRCLK, I2S_DOUT);
     audio.setVolumeSteps(VOLUMESTEPS);
-    audio.setVolume(rtcVolume);
-    audio.setTone(eqLow, eqMid, eqHigh);
+    audio.setVolume(lastPos);
+    applyPreset(currentPresetIdx);   // l'EQ arriva dal preset, non più da state.json
 
-    currentStationIdx = rtcStationIdx;
-    currentPresetIdx  = rtcPresetIdx;
-    int startVolume   = rtcVolume;
-    uiRetry           = rtcWifiPowerIdx;
+    int startVolume   = lastPos;
 
     encoderVolume.setPosition(startVolume / ROTARYSTEPS);
     lastPos = startVolume;
@@ -712,7 +703,6 @@ void setup() {
         } else if (currentState == STATE_PLAYER) {
             currentPresetIdx = (currentPresetIdx + 1) % NUM_PRESETS;
             applyPreset(currentPresetIdx);
-            rtcPresetIdx = currentPresetIdx;
             scheduleSave();
             startPresetBlinkFeedback(currentPresetIdx);
         }
@@ -755,7 +745,7 @@ void setup() {
 
             registerStationRoutes();
 
-            setLed(LED_CYAN);
+            setLed(LED_TTS);
             currentState = STATE_STATIONS_CONFIG;
         }
     });
@@ -813,13 +803,13 @@ void updateWarmupLed() {
     if (warmupLedDone) return;
     unsigned long elapsed = millis() - warmupStartTime;
     if (elapsed >= WARMUP_LED_MS) {
-        setLed(rgb.Color(255, 100, 0));
+        setLed(rgb.Color(255, 75, 0));
         warmupLedDone = true;
     } else {
         float progresso = (float)elapsed / (float)WARMUP_LED_MS;
         float fattoreLuce = progresso * progresso;
         uint8_t r = (uint8_t)(255 * fattoreLuce);
-        uint8_t g = (uint8_t)(100 * fattoreLuce);
+        uint8_t g = (uint8_t)(75 * fattoreLuce);
         setLed(rgb.Color(r, g, 0));
     }
 }
@@ -924,14 +914,14 @@ void loop() {
             } else if (warmupLedDone) {          // NEW: aspetta fine dissolvenza anche se già connesso
                 logSuSeriale(F("[WIFI] Connesso a BSSID=%s canale=%d rssi=%d dBm\n"),
                              WiFi.BSSIDstr().c_str(), WiFi.channel(), WiFi.RSSI());
-                if (rtcWifiPowerIdx != uiRetry) {
-                    WiFi.setSleep(WIFI_PS_NONE); 
-                    rtcWifiPowerIdx = uiRetry;
+                WiFi.setSleep(WIFI_PS_NONE);                              
+                if (savedWifiPowerIdx != uiRetry) {
+                    savedWifiPowerIdx = uiRetry;
                     saveState();
                 }
                 startMDNS();
                 setupOTA();
-                setLed(LED_CYAN);
+                setLed(LED_TTS);
                 isSpeakingStation = true;
                 ttsStartTime = millis();
                 //audio.stopSong();
@@ -958,7 +948,7 @@ void loop() {
 
             lastBlinkTime = millis();
             uiRetry = 0;
-            rtcWifiPowerIdx = uiRetry;
+            savedWifiPowerIdx = uiRetry;
             saveState();
             currentState = STATE_AP_MODE;
             break;
@@ -1046,7 +1036,6 @@ void loop() {
             if (lastPos != newPos) {
                 lastPos = newPos;
                 audio.setVolume(lastPos);
-                rtcVolume = lastPos;
                 scheduleSave();
             }
 
@@ -1063,10 +1052,9 @@ void loop() {
 
                     encoderStazioni.setPosition(currentStationIdx);
                     lastStPos     = currentStationIdx;
-                    rtcStationIdx = currentStationIdx;
                     scheduleSave();
 
-                    setLed(LED_CYAN);
+                    setLed(LED_TTS);
                     isSpeakingStation = true;
                     ttsStartTime = millis();
                     audio.connecttospeech(stations[currentStationIdx].name.c_str(),
@@ -1121,12 +1109,6 @@ void loop() {
 // Caricamento / Salvataggio stazioni
 // ─────────────────────────────────────────────────────────────────────────────
 bool loadStations() {
-    // 1. Inizializziamo LittleFS una sola volta
-    if (!LittleFS.begin(true)) {
-        logSuSeriale(F("[STATIONS] Impossibile montare LittleFS\n"));
-        return false;
-    }
-
     bool caricamentoRiuscito = false;
 
     // 2. TENTATIVO DI LETTURA DA FLASH
@@ -1162,9 +1144,7 @@ bool loadStations() {
     }
 
     // 3. SE LA LETTURA È ANDATA A BUON FINE
-    // Chiudiamo il file system e usciamo
     if (caricamentoRiuscito) {
-        LittleFS.end();
         return true;
     }
 
@@ -1188,18 +1168,11 @@ bool loadStations() {
     stations.push_back({"Subasio", "http://icy.unitedradio.it/Subasio.mp3", "it"});
     stations.push_back({"M2O", "http://streamcdnf26-4c4b867c89244861ac216426883d1ad0.msvdn.net/radiom2o/radiom2o/play1.m3u8", "it"});
 
-    // Chiudiamo il FS prima di chiamare saveStationsToFS (che gestirà la sua apertura in scrittura)
-    LittleFS.end();
-
     // Salva le stazioni di default su memoria flash per i successivi riavvii
     return saveStationsToFS();
 }
 
 bool saveStationsToFS() {
-    if (!LittleFS.begin(true)) return false;
-    File f = LittleFS.open("/stations.json", "w");
-    if (!f) { LittleFS.end(); return false; }
-
     JsonDocument doc;
     JsonArray arr = doc["stations"].to<JsonArray>();
     for (const auto& s : stations) {
@@ -1209,15 +1182,7 @@ bool saveStationsToFS() {
         obj["nameLang"] = s.nameLang;
     }
 
-    if (serializeJson(doc, f) == 0) {
-        f.close();
-        LittleFS.end();
-        return false;
-    }
-
-    f.close();
-    LittleFS.end();
-    return true;
+    return writeJsonAtomic("/stations.json", doc);
 }
 
 String jsonEscape(const String& s) {
