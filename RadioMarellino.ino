@@ -11,7 +11,8 @@
 #include "esp_system.h"
 #include <ESPmDNS.h>
 #include <ArduinoOTA.h>
-
+// ── Versione Firmware ─────────────────────────────────────────────────────────
+#define FW_VERSION "1.0.0"
 // ── Struttura stazione ────────────────────────────────────────────────────────
 struct Station {
     String name;
@@ -30,7 +31,23 @@ std::vector<Station> stations;
     #define I2S_BCLK   13
     #define I2S_LRCLK  14
 
-    // ── Pin Encoder Volume (KY-040) ───────────────────────────────────────────────LED_YELLOW
+    // ── Pin Encoder Volume (KY-040) ───────────────────────────────────────────────
+    #define PIN_DT   42
+    #define PIN_CLK  41
+    #define PIN_SW   9   // Pulsante encoder volume → deep sleep
+
+    // ── Pin Encoder Stazioni ──────────────────────────────────────────────────────
+    #define PIN_ST_DT   4
+    #define PIN_ST_CLK  5
+    #define PIN_ST_SW   10
+    //Pin wakeup deep sleep
+    #define PIN_WAKEUP  9
+    // ── LED RGB WS2812B ───────────────────────────────────────────────────────────
+    #define PIN_LED_RGB  48 //7 //48
+    #define NUM_LEDS     1 //8 //1
+#endif
+#if defined(ARDUINO_YB_ESP32_S3_AMP)
+    // ── Pin Encoder Volume (KY-040) ───────────────────────────────────────────────
     #define PIN_DT   42
     #define PIN_CLK  41
     #define PIN_SW   9   // Pulsante encoder volume → deep sleep
@@ -43,34 +60,18 @@ std::vector<Station> stations;
     #define PIN_WAKEUP  9
     // ── LED RGB WS2812B ───────────────────────────────────────────────────────────
     #define PIN_LED_RGB  7 //48
-    #define NUM_LEDS     8 //1 
-#endif
-#if defined(ARDUINO_YB_ESP32_S3_AMP)
-    // ── Pin Encoder Volume (KY-040) ───────────────────────────────────────────────LED_YELLOW
-    #define PIN_DT   42
-    #define PIN_CLK  41
-    #define PIN_SW   9   // Pulsante encoder volume → deep sleepLED_YELLOW
-
-    // ── Pin Encoder Stazioni ──────────────────────────────────────────────────────
-    #define PIN_ST_DT   4
-    #define PIN_ST_CLK  5
-    #define PIN_ST_SW   10
-    //Pin wakeup deep sleep
-    #define PIN_WAKEUP  9
-    // ── LED RGB WS2812B ───────────────────────────────────────────────────────────
-    #define PIN_LED_RGB  48 //7 
-    #define NUM_LEDS     1 //8
+    #define NUM_LEDS     8 //1
 #endif
 Adafruit_NeoPixel rgb(NUM_LEDS, PIN_LED_RGB, NEO_GRB + NEO_KHZ800);
 
 // Colori LED
 #define LED_OFF    rgb.Color(0,   0,   0)
-#define LED_YELLOW rgb.Color(255, 75,  0)   // Player/warmup done
+#define LED_OTA rgb.Color(0, 0,  255)   // OTA
 #define LED_RED    rgb.Color(255,   0,  0)   // modalità AP
-#define LED_GREEN  rgb.Color(255,   100,  0)   // riproduzione
+#define LED_PLAYING  rgb.Color(255,   75,  0)   // riproduzione
 #define LED_TTS   rgb.Color(255,   55, 0)  // annuncio TTS
 #define LED_MAGENTA rgb.Color(255,   0, 255)  // attesa OTA
-#define LED_CYAN rgb.Color(0, 200, 255)  // attesa OTA
+#define LED_CONFIG rgb.Color(0, 200, 255)  // Configurazione
 
 // ── Parametri encoder volume ──────────────────────────────────────────────────
 #define ROTARYSTEPS    1
@@ -83,6 +84,9 @@ Adafruit_NeoPixel rgb(NUM_LEDS, PIN_LED_RGB, NEO_GRB + NEO_KHZ800);
 #define PRESET_LONGPRESS_MS  500
 // ── Soglia pressione molto prolungata pulsante → ingresso modalità AP ────────
 #define AP_LONGPRESS_MS      4000
+
+// ── Soglia minima RSSI per connettersi al WiFi: sotto questo valore si va in modalità AP ──
+#define WIFI_MIN_RSSI_DBM    -75
 
 // ── Range accettato per i valori EQ dei preset (validazione lato firmware) ───
 #define EQ_MIN_DB  -12.0f
@@ -147,7 +151,22 @@ int lastPos           = -1;
 int lastStPos         = 0;
 int currentStationIdx = 0;
 int currentPresetIdx  = 0;
+int lastVolPos        = 0;      // posizione encoder volume nella modalità selezione preset
 bool vuMeterAttivo    = false;  
+
+// ── Modalità Selezione Preset tramite encoder Volume ──────────────────────────
+// Pressione semilunga sul pulsante volume → entra/esce; rotazione → scorre i preset
+bool inPresetSelectionMode = false;
+unsigned long presetSelectionLastActivity = 0;
+const unsigned long PRESET_MODE_TIMEOUT_MS = 4000;  // uscita automatica dopo 4 s di inattività
+const unsigned long PRESET_STEP_LOCKOUT_MS = 200;   // dopo un passo ignora l'encoder per questo tempo (anti-rimbalzo / un passo per gesto)
+unsigned long presetStepLastTime = 0;
+
+// ── Watchdog Buffer Stream ────────────────────────────────────────────────────
+unsigned long streamStallStartTime = 0;
+const unsigned long STREAM_STALL_TIMEOUT_MS = 10000; // 10 secondi di buffer a zero = blocco
+unsigned long streamStartPlayTime = 0;
+const unsigned long STREAM_GRACE_PERIOD_MS = 5000; // 5 secondi di tolleranza all'avvio
 
 // ── Credenziali WiFi ──────────────────────────────────────────────────────────
 String wifiSsid = "";
@@ -221,6 +240,8 @@ void registerStationRoutes();
 void applyPreset(int idx);
 void startPresetBlinkFeedback(int idx);
 void tickPresetBlink();
+void enterPresetSelectionMode();
+void exitPresetSelectionMode(bool withBlink);
 void loadPresets();
 bool savePresetsToFS();
 void handleSavePresets();
@@ -278,12 +299,38 @@ void tickPresetBlink() {
         presetBlinkCount++;
         if (presetBlinkCount >= presetBlinkTarget) {
             presetBlinkActive = false;
-            if (!vuMeterAttivo && !isSpeakingStation) setLed(LED_GREEN);
+            if (!vuMeterAttivo && !isSpeakingStation && !inPresetSelectionMode) setLed(LED_PLAYING);
         } else {
             setLed(audioPresets[currentPresetIdx].ledColor);
             presetBlinkPhase = true;
         }
     }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Modalità Selezione Preset (encoder Volume)
+// ─────────────────────────────────────────────────────────────────────────────
+void enterPresetSelectionMode() {
+    inPresetSelectionMode       = true;
+    presetSelectionLastActivity = millis();
+    presetBlinkActive           = false;
+    encoderVolume.setPosition(currentPresetIdx);
+    lastVolPos = currentPresetIdx;
+    setLed(audioPresets[currentPresetIdx].ledColor);
+    logSuSeriale(F("[PRESET] Entrato in modalità selezione preset\n"));
+}
+
+// withBlink = true  → a conferma lampeggia (idx+1) volte nel colore del preset
+// withBlink = false → nessun feedback LED (il chiamante gestisce il LED, es. cambio stazione)
+void exitPresetSelectionMode(bool withBlink) {
+    if (!inPresetSelectionMode) return;
+    inPresetSelectionMode = false;
+    // ripristina la posizione dell'encoder sul volume corrente
+    encoderVolume.setPosition(lastPos / ROTARYSTEPS);
+    if (withBlink && !isSpeakingStation) {
+        startPresetBlinkFeedback(currentPresetIdx);
+    }
+    logSuSeriale(F("[PRESET] Uscita da modalità selezione preset\n"));
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -452,6 +499,7 @@ void enterApModeFromButton() {
     audio.stopSong();
     isSpeakingStation = false;
     hasPendingPlay    = false;
+    inPresetSelectionMode = false;
     setLed(LED_OFF);
     currentState = STATE_START_AP;
 }
@@ -582,10 +630,11 @@ void my_audio_info(Audio::msg_t m) {
         if (isSpeakingStation) {
             isSpeakingStation = false;
             //hasPendingPlay = true;
-            if (!vuMeterAttivo) setLed(LED_GREEN);
+            if (!vuMeterAttivo && !inPresetSelectionMode) setLed(LED_PLAYING);
             logSuSeriale(F("Qui: %s\n"), stations[currentStationIdx].url.c_str());
             if (!audio.connecttohost(stations[currentStationIdx].url.c_str()))
                 ESP.restart();
+            streamStartPlayTime = millis(); // <--- Segnamo l'inizio per il periodo di grazia
             logSuSeriale(F("qui\n"));
         }
     }     
@@ -602,14 +651,14 @@ void setupOTA() {
 
     ArduinoOTA.onStart([]() {
         audio.stopSong();
-        setLed(LED_YELLOW);
+        setLed(LED_OTA);
         currentState = STATE_OTA;
         logSuSeriale(F("[OTA] Avvio aggiornamento (%s)\n"),
                      (ArduinoOTA.getCommand() == U_FLASH) ? "firmware" : "filesystem");
     });
 
     ArduinoOTA.onEnd([]() {
-        setLed(LED_GREEN);
+        setLed(LED_PLAYING);
         logSuSeriale(F("[OTA] Completato, riavvio\n"));
     });
 
@@ -632,7 +681,7 @@ void setupOTA() {
         else if (error == OTA_END_ERROR)     logSuSeriale(F("Errore end\n"));
 
         currentState   = STATE_PLAYER;
-        if (!vuMeterAttivo) setLed(LED_GREEN);
+        if (!vuMeterAttivo) setLed(LED_PLAYING);
         hasPendingPlay = true;
         pendingUrl     = stations[currentStationIdx].url;
     });
@@ -661,6 +710,17 @@ void setup() {
 
     esp_sleep_wakeup_cause_t cause = esp_sleep_get_wakeup_cause();
     if (cause == ESP_SLEEP_WAKEUP_EXT1) {
+        // Filtro anti-spike: il pulsante deve risultare ancora premuto (pin basso),
+        // altrimenti il risveglio è stato causato da un disturbo sulla rete/alimentazione
+        pinMode(PIN_WAKEUP, INPUT_PULLUP);
+        delay(20);
+        if (digitalRead(PIN_WAKEUP) == HIGH) {
+            logSuSeriale(F("[BOOT] Risveglio spurio (disturbo), torno in sleep\n"));
+            Serial.flush();
+            ledPinSleepHold(true);
+            esp_sleep_enable_ext1_wakeup(1ULL << PIN_WAKEUP, ESP_EXT1_WAKEUP_ANY_LOW);
+            esp_deep_sleep_start();
+        }        
         logSuSeriale(F("[BOOT] Wakeup da pulsante, avvio normale\n"));
     } else if (esp_reset_reason() == ESP_RST_SW) {
         logSuSeriale(F("[BOOT] Restart software (ESP.restart), avvio normale\n"));
@@ -701,10 +761,12 @@ void setup() {
         if (btnVolume.getPressedMs() >= AP_LONGPRESS_MS) {
             enterApModeFromButton();
         } else if (currentState == STATE_PLAYER) {
-            currentPresetIdx = (currentPresetIdx + 1) % NUM_PRESETS;
-            applyPreset(currentPresetIdx);
-            scheduleSave();
-            startPresetBlinkFeedback(currentPresetIdx);
+            // Pressione semilunga: entra/esce dalla modalità selezione preset
+            if (inPresetSelectionMode) {
+                exitPresetSelectionMode(true);
+            } else {
+                enterPresetSelectionMode();
+            }
         }
     });
 
@@ -713,12 +775,12 @@ void setup() {
     btnStazioni.attachClick([]() {
         if (currentState == STATE_PLAYER) {
             vuMeterAttivo = !vuMeterAttivo;
-            if (!vuMeterAttivo && !isSpeakingStation) {
-                setLed(LED_GREEN);
+            if (!vuMeterAttivo && !isSpeakingStation && !inPresetSelectionMode) {
+                setLed(LED_PLAYING);
             }
         } else if (currentState == STATE_OTA_WAIT) {
             currentState   = STATE_PLAYER;
-            if (!vuMeterAttivo) setLed(LED_GREEN);
+            if (!vuMeterAttivo) setLed(LED_PLAYING);
             hasPendingPlay = true;
             pendingUrl     = stations[currentStationIdx].url;
         }
@@ -730,6 +792,7 @@ void setup() {
             isSpeakingStation = false;
             hasPendingPlay    = false;
             vuMeterAttivo     = false;
+            inPresetSelectionMode = false;
             otaWaitStartTime  = millis();
             currentState      = STATE_OTA_WAIT;
             logSuSeriale(F("[OTA] In attesa di aggiornamento...\n"));
@@ -742,6 +805,7 @@ void setup() {
             isSpeakingStation = false;
             hasPendingPlay    = false;
             vuMeterAttivo     = false;
+            inPresetSelectionMode = false;
 
             registerStationRoutes();
 
@@ -856,12 +920,17 @@ void loop() {
                 uint8_t macAddressForte[6]; // Conterrà i 6 byte del MAC Address
                 String  macAddressForteStr = ""; // Stringa leggibile per il log su seriale
                 int32_t maxRssi = -100;
+                int32_t maxRssiVisto = -127;     // miglior RSSI in assoluto, anche sotto soglia (solo per il log)
                 bool    ripetitoreTrovato = false;
+                bool    ssidVisto         = false;   // SSID presente nella scansione, anche se con segnale debole
 
                 for (int i = 0; i < n; ++i) {
                     if (WiFi.SSID(i) == wifiSsid) {
                         // Trovato un punto di accesso con il nostro nome. È il più forte visto finora?
-                        if (WiFi.RSSI(i) > maxRssi) {
+                        // Si considerano solo gli AP con segnale >= WIFI_MIN_RSSI_DBM
+                        ssidVisto = true;
+                        if (WiFi.RSSI(i) > maxRssiVisto) maxRssiVisto = WiFi.RSSI(i);
+                        if (WiFi.RSSI(i) >= WIFI_MIN_RSSI_DBM && WiFi.RSSI(i) > maxRssi) {
                             maxRssi = WiFi.RSSI(i);
                             memcpy(macAddressForte, WiFi.BSSID(i), 6); // Copia l'indirizzo hardware nei 6 byte
                             macAddressForteStr = WiFi.BSSIDstr(i);      // Salva la stringa (es. "AA:BB:CC:DD:EE:FF")
@@ -872,6 +941,14 @@ void loop() {
                 }
                 // Puliamo la memoria della scansione
                 WiFi.scanDelete();
+
+                // ── SEGNALE TROPPO DEBOLE: come se il WiFi non ci fosse → modalità AP ──
+                if (ssidVisto && !ripetitoreTrovato) {
+                    logSuSeriale(F("[WIFI] Segnale troppo debole (%d dBm < %d dBm), vado in modalità AP\n"),
+                                 maxRssiVisto, WIFI_MIN_RSSI_DBM);
+                    currentState = STATE_START_AP;
+                    break;
+                }
 
                 // ── CONNESSIONE MIRATA AL MAC ADDRESS PIÙ FORTE ──
                 if (ripetitoreTrovato) {
@@ -997,11 +1074,43 @@ void loop() {
                 diagLoopWindowStart  = millis();
             }
 #endif
-            if (vuMeterAttivo && !isSpeakingStation && !presetBlinkActive) { 
+            // ── WATCHDOG STREAM BLOCCATO ──────────────────────────────────────
+            // Se non stiamo parlando (TTS), non siamo in selezione preset e l'audio è attivo:
+            if (!isSpeakingStation && !inPresetSelectionMode && !presetBlinkActive && (millis() - streamStartPlayTime > STREAM_GRACE_PERIOD_MS)) {
+                // Verifichiamo se il buffer è completamente vuoto
+                if (audio.inBufferFilled() == 0) {
+                    if (streamStallStartTime == 0) {
+                        streamStallStartTime = millis(); // Inizia a contare il tempo di stallo
+                    } else if (millis() - streamStallStartTime >= STREAM_STALL_TIMEOUT_MS) {
+                        logSuSeriale(F("[WATCHDOG] Stream bloccato (buffer vuoto da troppi secondi). Riavvio connessione...\n"));
+                        
+                        // Resetta il timer del watchdog
+                        streamStallStartTime = 0;
+                        
+                        // Ferma la canzone corrente e forza la riconnessione alla stazione attiva
+                        audio.stopSong();
+                        delay(100);
+                        hasPendingPlay = true;
+                        pendingUrl = stations[currentStationIdx].url;
+                    }
+                } else {
+                    // Il buffer si è riempito o sta ricevendo dati: azzeriamo il timer
+                    streamStallStartTime = 0;
+                }
+            } else {
+                streamStallStartTime = 0;
+            }
+
+            if (vuMeterAttivo && !isSpeakingStation && !presetBlinkActive && !inPresetSelectionMode) { 
                 //aggiornaLedVuMeter(audio.getVUlevel());
             }
 
             tickPresetBlink();
+
+            // Timeout inattività modalità selezione preset
+            if (inPresetSelectionMode && (millis() - presetSelectionLastActivity >= PRESET_MODE_TIMEOUT_MS)) {
+                exitPresetSelectionMode(true);
+            }
 
             if (pendingSave && (millis() - lastSaveTime >= SAVE_DEBOUNCE_MS)) {
                 pendingSave = false;
@@ -1012,7 +1121,7 @@ void loop() {
                 isSpeakingStation = false;
                 audio.stopSong();
                 delay(50);
-                if (!vuMeterAttivo) setLed(LED_GREEN);
+                if (!vuMeterAttivo && !inPresetSelectionMode) setLed(LED_PLAYING);
                 pendingUrl     = stations[currentStationIdx].url;
                 hasPendingPlay = true;
             }
@@ -1021,22 +1130,47 @@ void loop() {
                 hasPendingPlay = false;
                 audio.connecttohost(pendingUrl.c_str());
                 audio.setTone(eqLow, eqMid, eqHigh);
+                streamStartPlayTime = millis(); // <--- Segnamo l'inizio per il periodo di grazia
             }
 
-            int newPos = encoderVolume.getPosition() * ROTARYSTEPS;
+            if (inPresetSelectionMode) {
+                // ── Selezione preset: l'encoder volume scorre i preset ──────────
+                int rawVolPos = encoderVolume.getPosition();
+                if (rawVolPos != lastVolPos) {
+                    presetSelectionLastActivity = millis();
 
-            if (newPos < ROTARYMIN) {
-                encoderVolume.setPosition(ROTARYMIN / ROTARYSTEPS);
-                newPos = ROTARYMIN;
-            } else if (newPos > ROTARYMAX) {
-                encoderVolume.setPosition(ROTARYMAX / ROTARYSTEPS);
-                newPos = ROTARYMAX;
-            }
+                    // Un solo passo per gesto: durante il lockout il movimento viene scartato
+                    if (millis() - presetStepLastTime >= PRESET_STEP_LOCKOUT_MS) {
+                        if (rawVolPos > lastVolPos)
+                            currentPresetIdx = (currentPresetIdx + 1) % NUM_PRESETS;
+                        else
+                            currentPresetIdx = (currentPresetIdx - 1 + NUM_PRESETS) % NUM_PRESETS;
+                        applyPreset(currentPresetIdx);
+                        scheduleSave();
+                        setLed(audioPresets[currentPresetIdx].ledColor);
+                        presetStepLastTime = millis();
+                    }
 
-            if (lastPos != newPos) {
-                lastPos = newPos;
-                audio.setVolume(lastPos);
-                scheduleSave();
+                    // In ogni caso azzera lo spostamento accumulato (scarta scatti extra e rimbalzi)
+                    encoderVolume.setPosition(currentPresetIdx);
+                    lastVolPos = currentPresetIdx;
+                }
+            } else {
+                int newPos = encoderVolume.getPosition() * ROTARYSTEPS;
+
+                if (newPos < ROTARYMIN) {
+                    encoderVolume.setPosition(ROTARYMIN / ROTARYSTEPS);
+                    newPos = ROTARYMIN;
+                } else if (newPos > ROTARYMAX) {
+                    encoderVolume.setPosition(ROTARYMAX / ROTARYSTEPS);
+                    newPos = ROTARYMAX;
+                }
+
+                if (lastPos != newPos) {
+                    lastPos = newPos;
+                    audio.setVolume(lastPos);
+                    scheduleSave();
+                }
             }
 
             int newStPos = encoderStazioni.getPosition();
@@ -1053,6 +1187,8 @@ void loop() {
                     encoderStazioni.setPosition(currentStationIdx);
                     lastStPos     = currentStationIdx;
                     scheduleSave();
+
+                    if (inPresetSelectionMode) exitPresetSelectionMode(false);
 
                     setLed(LED_TTS);
                     isSpeakingStation = true;
@@ -1072,7 +1208,7 @@ void loop() {
             if (millis() - lastBlinkTime >= 500) {
                 lastBlinkTime = millis();
                 blinkState = !blinkState;
-                setLed(blinkState ? LED_CYAN : LED_OFF);
+                setLed(blinkState ? LED_CONFIG : LED_OFF);
             }  
             delay(2);
             break;
@@ -1087,7 +1223,7 @@ void loop() {
             }
             if (millis() - otaWaitStartTime >= OTA_WAIT_TIMEOUT_MS) {
                 currentState   = STATE_PLAYER;
-                if (!vuMeterAttivo) setLed(LED_GREEN);
+                if (!vuMeterAttivo) setLed(LED_PLAYING);
                 hasPendingPlay = true;
                 pendingUrl     = stations[currentStationIdx].url;
                 logSuSeriale(F("[OTA] Timeout attesa, riprendo riproduzione\n"));
@@ -1268,6 +1404,7 @@ void handleManageStations() {
         .preset-field { display: flex; flex-direction: column; gap: 2px; flex: 1; }
         .preset-field span { font-size: 0.65rem; font-weight: 600; color: #94a3b8; text-align: center; text-transform: uppercase; }
         .preset-field input { width: 100%; padding: 8px 4px; border: 1px solid #cbd5e1; border-radius: 6px; font-size: 0.9rem; text-align: center; background-color: #f8fafc; -webkit-appearance: none; }
+        .fw-footer { text-align: center; font-size: 0.75rem; color: #94a3b8; margin-top: 8px; padding: 8px 0; font-weight: 500; }
     </style>
 </head>
 <body>
@@ -1337,9 +1474,14 @@ void handleManageStations() {
             <button type='submit' class='btn btn-green'>💾 Salva ed Esci (Riavvia)</button>
         </form>
     </div>
-</div>
+<div class='fw-footer'>
 )raw");
+    server.sendContent("Firmware Versione: " + String(FW_VERSION));
 
+    server.sendContent(R"raw(
+        </div>
+    </div>
+    )raw");
     server.sendContent("\n<script>\nlet stations = " + stationsJson + ";\nlet presets = " + presetsJson + ";\n");
 
     server.sendContent(R"raw(
