@@ -12,7 +12,7 @@
 #include <ESPmDNS.h>
 #include <ArduinoOTA.h>
 // ── Versione Firmware ─────────────────────────────────────────────────────────
-#define FW_VERSION "1.0.0"
+#define FW_VERSION "1.1.1"
 // ── Struttura stazione ────────────────────────────────────────────────────────
 struct Station {
     String name;
@@ -43,8 +43,8 @@ std::vector<Station> stations;
     //Pin wakeup deep sleep
     #define PIN_WAKEUP  9
     // ── LED RGB WS2812B ───────────────────────────────────────────────────────────
-    #define PIN_LED_RGB  48 //7 //48
-    #define NUM_LEDS     1 //8 //1
+    #define PIN_LED_RGB  7 //48
+    #define NUM_LEDS     8 //1
 #endif
 #if defined(ARDUINO_YB_ESP32_S3_AMP)
     // ── Pin Encoder Volume (KY-040) ───────────────────────────────────────────────
